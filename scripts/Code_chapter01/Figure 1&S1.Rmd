@@ -1,0 +1,1395 @@
+---
+title: "Figure 1&S1"
+output: html_document
+date: "2026-05-14"
+---
+
+```{r 1. Load All Required Packages}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(fs)
+library(matrixStats)
+library(ggrepel)
+library(limma)
+library(plotly)
+library(pheatmap)
+library(VIM)
+library(sva)
+library(RColorBrewer)
+library(ggforce)
+library(patchwork)
+library(corrplot)
+library(scales)
+library(knitr)
+library(reshape2)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(openxlsx)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+
+source(file.path(knitr::current_input(dir = TRUE), "..", "_common", "repro_paths.R"))
+paths <- repro_paths("Code_chapter01")
+repo_root <- paths$repo_root
+input_dir <- paths$input_dir
+data_dir <- paths$results_dir
+fig_dir <- paths$results_dir
+folder_path <- file.path(input_dir, "Data processing and Quality assessment")
+
+# --- Parameter Settings ---
+file_pattern <- "\\.xlsx$"     # File matching pattern
+protein_id_col <- "Accession"  # Protein ID column name
+missing_threshold <- 30        # Missing value filtering threshold (%)
+
+# Normalization parameters
+dmso_pattern <- "DMSO"
+pool_pattern <- "pool"
+
+# Missing value imputation parameters
+impute_width <- 0.3 
+impute_shift <- 1.8
+```
+
+#  STEP 1: Data Import and Merging
+
+```{r}
+# Get file list
+file_list <- dir_ls(folder_path, regexp = file_pattern)
+
+if (length(file_list) == 0) stop("No Excel files found. Please check folder_path.")
+cat("Found", length(file_list), "files.\n")
+
+# Read and merge
+all_data_list <- list()
+
+for (file in file_list) {
+  batch_name <- tools::file_path_sans_ext(basename(file))
+  temp_data <- read_excel(file)
+  
+  # Rename columns: Add BatchID prefix
+  new_names <- sapply(names(temp_data), function(col) {
+    if (col == protein_id_col) return(protein_id_col)
+    else return(paste(batch_name, col, sep = "_"))
+  })
+  names(temp_data) <- new_names
+  all_data_list[[batch_name]] <- temp_data
+}
+
+# Merge all data
+protein_data <- purrr::reduce(all_data_list, full_join, by = protein_id_col)
+cat("Merged data dimensions:", paste(dim(protein_data), collapse = " x "), "\n")
+
+# Generate Sample Info
+sample_info <- tibble(FullSampleName = names(protein_data)[-1]) %>%
+  mutate(
+    Batch = str_extract(FullSampleName, "^[^_]+"),
+    SampleType = str_extract(FullSampleName, "[^_]+$")
+  )
+
+# Save intermediate results
+write.xlsx(protein_data, file.path(data_dir, "01_Raw_Data_Merged_10219_841.xlsx"))
+write.xlsx(sample_info, file.path(data_dir, "02_Sample_Info.xlsx"))
+```
+
+# STEP 2: Contaminant Filtering
+
+```{r filter_contaminants}
+# Contaminant list file path
+contaminant_file_path <- file.path(input_dir, "Dec2022_Sample specific FASTA protein list.xlsx")
+
+initial_count <- nrow(protein_data)
+protein_data <- protein_data %>% 
+  filter(!str_starts(!!sym(protein_id_col), "Cont"))
+
+cat(paste0("Remaining proteins after removing 'Cont' prefix: ", nrow(protein_data), 
+           " (Removed ", initial_count - nrow(protein_data), ")\n"))
+
+contaminant_file <- file.path(input_dir, "Dec2022_Sample specific FASTA protein list.xlsx")
+
+if (file.exists(contaminant_file)) {
+  
+  cat(paste("\nReading contaminant list:", contaminant_file, "...\n"))
+  
+  # Read Excel
+  contaminants_library <- read_excel(contaminant_file, sheet = "common 381")
+  
+  # Extract IDs and filter
+  contaminant_ids <- contaminants_library$`Uniprot ID`
+  
+  # Calculate number to be removed
+  n_to_remove <- sum(protein_data$Accession %in% contaminant_ids)
+  
+  # Perform filtering
+  protein_data <- protein_data[!protein_data$Accession %in% contaminant_ids, ]
+  
+  cat(paste0("Removed ", n_to_remove, " contaminant proteins based on list.\n"))
+  
+  # Clean up temporary variables
+  rm(contaminants_library, contaminant_ids)
+  
+} else {
+  warning(paste("Contaminant list file not found:", contaminant_file, ". Only prefix filtering performed."))
+}
+
+# Output results
+final_protein_count <- nrow(protein_data)
+cat(paste0("\n>>> Final protein count after filtering: ", final_protein_count, "\n"))
+
+# Save file to data_dir folder
+save_file_name <- paste0("03_Contaminants_Removed_", final_protein_count, ".xlsx") 
+write.xlsx(protein_data, file.path(data_dir, save_file_name))
+
+# Environment cleanup
+suppressWarnings(rm(protein_data_filtered, clean_expression_matrix, temp_data))
+```
+
+# STEP 3: Data Completeness Statistics
+
+```{r data_completeness}
+quant_mat <- as.matrix(protein_data[, -1])
+n_compounds <- ncol(quant_mat)
+n_nonmiss_per_protein <- rowSums(!is.na(quant_mat))
+
+# 1. Protein count at different quantification fractions
+fractions <- seq(0.1, 1, by = 0.1)
+thresholds <- ceiling(fractions * n_compounds)
+proteins_at_least <- sapply(thresholds, function(th) sum(n_nonmiss_per_protein >= th))
+
+df_completeness <- data.frame(fraction = fractions, n_proteins = proteins_at_least)
+
+p_completeness <- ggplot(df_completeness, aes(x = fraction, y = n_proteins)) +
+  geom_col(fill = "#C7E0FB") +
+  scale_x_continuous(labels = scales::percent) +
+  labs(title = "Dataset Completeness", x = "Min % of Compounds Quantified", y = "Number of Proteins") +
+  theme_bw() + theme(aspect.ratio = 1)
+print(p_completeness)
+
+# 2. Proteome depth per compound
+n_proteins_per_compound <- colSums(!is.na(quant_mat))
+df_depth <- data.frame(compound = colnames(quant_mat), n_proteins = n_proteins_per_compound)
+stats_vec <- c(
+  min    = min(df_depth$n_proteins, na.rm = TRUE),
+  median = median(df_depth$n_proteins, na.rm = TRUE),
+  mean   = round(mean(df_depth$n_proteins, na.rm = TRUE)),
+  max    = max(df_depth$n_proteins, na.rm = TRUE)
+)
+
+stats_df <- data.frame(
+  stat  = c("Min", "Median", "Mean", "Max"),
+  value = c(stats_vec["min"], stats_vec["median"], stats_vec["mean"], stats_vec["max"])
+)
+
+subtitle_txt <- sprintf(
+  "Min = %d, Median = %d, Mean = %d, Max = %d",
+  round(stats_vec["min"]),
+  round(stats_vec["median"]),
+  stats_vec["mean"],
+  round(stats_vec["max"])
+)
+
+cat("Proteome Depth Statistics per Compound:\n")
+print(stats_vec)
+
+p_depth <- ggplot(df_depth, aes(x = n_proteins)) +
+  geom_histogram(binwidth = 100, fill = "#C7E0FB", color = "white") +
+  geom_vline(
+    data = stats_df,
+    aes(xintercept = value, color = stat),
+    linetype = "dashed",
+    linewidth = 0.8,
+    show.legend = TRUE
+  ) +
+  scale_color_manual(
+    name   = "Statistic",
+    values = c("Min" = "gray40", "Median" = "orange", "Mean" = "blue", "Max" = "red")
+  ) +
+  labs(
+    title    = "Proteome Depth per Compound",
+    subtitle = subtitle_txt,
+    x = "Proteins Quantified",
+    y = "Number of Compounds"
+  ) +
+  theme_bw() + theme(aspect.ratio = 1)
+
+print(p_depth)
+#write.xlsx(df_completeness, file.path(data_dir, "Plot01_df_completeness.xlsx"))
+#write.xlsx(df_depth, file.path(data_dir, "Plot02_df_depth.xlsx"))
+#ggsave(file.path(fig_dir, "01_p_completeness.pdf"), p_completeness, width = 7, height = 7)
+#ggsave(file.path(fig_dir, "02_p_depth.pdf"), p_depth, width = 7, height = 7)
+```
+
+#  STEP 4: Missing Value Filtering
+
+```{r filter_missing}
+missing_rates <- rowSums(is.na(protein_data[, -1])) / ncol(protein_data[, -1]) * 100
+remaining_proteins <- protein_data[missing_rates <= missing_threshold, ]
+
+cat("Filtering proteins with missing rate >", missing_threshold, "%.\n")
+cat("Remaining protein count:", nrow(remaining_proteins), "\n")
+
+write.xlsx(remaining_proteins, file.path(data_dir, "04_Filtered_Missing_70percent_6682.xlsx"))
+protein_data <- remaining_proteins # Update main data
+```
+
+# STEP 5 & 6: Within-Batch Normalization (TIC)
+
+```{r tic_normalization}
+long_data <- protein_data %>%
+  pivot_longer(cols = -all_of(protein_id_col), names_to = "SampleFullName", values_to = "Intensity") %>%
+  separate(SampleFullName, into = c("BatchID", "Channel"), sep = "_", extra = "merge")
+
+# Calculate TIC
+total_intensities <- long_data %>% group_by(BatchID, Channel) %>% 
+  summarise(Total_Intensity = sum(Intensity, na.rm = TRUE), .groups = 'drop')
+target_intensities <- total_intensities %>% group_by(BatchID) %>% 
+  summarise(Target_Intensity = mean(Total_Intensity, na.rm = TRUE), .groups = 'drop')
+
+# Apply normalization
+long_data_normalized <- long_data %>%
+  left_join(total_intensities, by = c("BatchID", "Channel")) %>%
+  left_join(target_intensities, by = "BatchID") %>%
+  mutate(Intensity_Normalized = Intensity * (Target_Intensity / Total_Intensity)) %>%
+  dplyr::select(!!sym(protein_id_col), BatchID, Channel, Intensity = Intensity_Normalized)
+
+cat("TIC Normalization completed.\n")
+
+# Visualization (Sampling 10%)
+set.seed(123)
+proteins_sample <- sample(unique(long_data$Accession), size = floor(0.1 * nrow(protein_data)))
+plot_data_tic <- long_data_normalized %>%
+  filter(Accession %in% proteins_sample) %>%
+  mutate(Log2_Intensity = log2(Intensity + 1))
+
+p_tic <- ggplot(plot_data_tic, aes(x = BatchID, y = Log2_Intensity)) +
+  geom_boxplot(outlier.shape = NA, fill = "lightblue") +
+  labs(title = "Intensity Distribution After TIC Normalization") +
+  theme_bw() + theme(axis.text.x = element_text(angle = 90))
+print(p_tic)
+```
+
+# STEP 7 & 8: Between-Batch Normalization (DMSO Bridging)
+
+```{r dmso_bridging}
+log_intensity_long <- long_data_normalized %>%
+  unite("SampleID", BatchID, Channel, sep = "_", remove = FALSE) %>%
+  mutate(Log2_Intensity = log2(Intensity + 1))
+
+# Convert back to wide matrix
+log_intensity_matrix <- log_intensity_long %>%
+  pivot_wider(id_cols = !!sym(protein_id_col), names_from = SampleID, values_from = Log2_Intensity) %>%
+  column_to_rownames(var = protein_id_col)
+
+# Calculate global DMSO mean
+dmso_cols <- colnames(log_intensity_matrix)[str_detect(colnames(log_intensity_matrix), dmso_pattern)]
+global_mean_dmso <- rowMeans(log_intensity_matrix[, dmso_cols], na.rm = TRUE)
+
+# Perform correction
+dmso_corrected_matrix <- log_intensity_matrix
+all_batches <- unique(long_data_normalized$BatchID)
+
+for (batch in all_batches) {
+  cols_in_batch <- colnames(log_intensity_matrix)[str_starts(colnames(log_intensity_matrix), paste0(batch, "_"))]
+  dmso_col_in_batch <- cols_in_batch[str_detect(cols_in_batch, dmso_pattern)]
+  
+  if (length(dmso_col_in_batch) == 1) {
+    correction_vector <- global_mean_dmso - log_intensity_matrix[, dmso_col_in_batch]
+    correction_vector[is.na(correction_vector)] <- 0
+    # Correct all columns in this batch
+    dmso_corrected_matrix[, cols_in_batch] <- log_intensity_matrix[, cols_in_batch] + correction_vector
+  }
+}
+
+# write.xlsx(dmso_corrected_matrix, file.path(data_dir, "05_DMSO_Corrected_Matrix_Before_Imputation.xlsx"), rowNames = TRUE)
+
+# Effect evaluation boxplot
+plot_data_dmso <- as.data.frame(dmso_corrected_matrix) %>%
+  pivot_longer(cols = everything(), names_to = "SampleID", values_to = "Log2_Intensity") %>%
+  mutate(Batch = str_extract(SampleID, "^[^_]+")) %>%
+  mutate(Batch_Num = as.numeric(str_extract(Batch, "\\d+"))) %>%
+  mutate(Batch = fct_reorder(Batch, Batch_Num))
+
+p_dmso_box <- ggplot(plot_data_dmso, aes(x = Batch, y = Log2_Intensity)) +
+  geom_boxplot(outlier.shape = NA, fill = "#9e539d", alpha=0.6) +
+  labs(title = "Intensity After DMSO Bridging Correction", x = "Batch") +
+  theme_bw() + theme(axis.text.x = element_text(angle = 90))
+print(p_dmso_box)
+```
+
+#  STEP 9: Combined Visualization of Within-Batch & DMSO Correction
+
+```{r}
+before_long <- log_intensity_long %>%
+  dplyr::select(
+    dplyr::all_of(protein_id_col),
+    BatchID,
+    Channel,
+    Log2_Intensity
+  ) %>%
+  dplyr::mutate(Status = "Before Normalization")
+
+after_long <- as.data.frame(dmso_corrected_matrix) %>%
+  tibble::rownames_to_column(var = protein_id_col) %>%
+  tidyr::pivot_longer(
+    cols      = -dplyr::all_of(protein_id_col),
+    names_to  = "SampleID",
+    values_to = "Log2_Intensity"
+  ) %>%
+  tidyr::separate(
+    col  = SampleID,
+    into = c("BatchID", "Channel"),
+    sep  = "_",
+    extra = "merge"
+  ) %>%
+  dplyr::select(
+    dplyr::all_of(protein_id_col),
+    BatchID,
+    Channel,
+    Log2_Intensity
+  ) %>%
+  dplyr::mutate(Status = "After Normalization")
+
+# Merge data
+plot_data <- bind_rows(before_long, after_long) %>%
+  mutate(
+    Batch_Number = as.numeric(str_extract(BatchID, "\\d+")),
+    BatchID_Sorted = fct_reorder(BatchID, Batch_Number),
+    Status = factor(Status, levels = c("Before Normalization", "After Normalization")) 
+  )
+
+dmso_agg_boxplot_final <- ggplot(plot_data, aes(x = BatchID_Sorted, y = Log2_Intensity, fill = Status)) +
+  geom_boxplot(position = position_dodge(0.8), outlier.shape = NA) +
+  coord_cartesian(ylim = quantile(plot_data$Log2_Intensity, c(0.05, 0.95), na.rm = TRUE)) +
+  labs(
+    title = "Evaluation of Batch Correction Effect using DMSO Bridging",
+    subtitle = "Distribution of protein intensities across batches before and after normalization",
+    x = "Batch ID",
+    y = "Log2(Intensity)",
+    fill = "Normalization Status" 
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "top"
+  )
+
+print(dmso_agg_boxplot_final)
+```
+
+# STEP 10: Missing Value Imputation (MinDet)
+
+```{r imputation}
+set.seed(123)
+imputed_matrix <- as.matrix(dmso_corrected_matrix)
+
+for (i in 1:ncol(imputed_matrix)) {
+  vec <- imputed_matrix[, i]
+  if (any(is.na(vec))) {
+    stats <- c(mean = mean(vec, na.rm=T), sd = sd(vec, na.rm=T))
+    if (!is.na(stats['sd']) && stats['sd'] > 0) {
+      n_miss <- sum(is.na(vec))
+      imp_mean <- stats['mean'] - (impute_shift * stats['sd'])
+      imp_sd <- impute_width * stats['sd']
+      imputed_matrix[is.na(vec), i] <- rnorm(n_miss, mean = imp_mean, sd = imp_sd)
+    }
+  }
+}
+
+dmso_corrected_matrix <- imputed_matrix # Update main matrix
+# write.xlsx(dmso_corrected_matrix, file.path(data_dir, "06_DMSO_Corrected_Matrix_After_Imputation.xlsx"), rowNames = TRUE)
+```
+
+# STEP 11: ComBat Correction
+
+```{r ComBat}
+corrected_matrix <- ComBat(dat = dmso_corrected_matrix, batch = sample_info$Batch, mod = NULL, par.prior = TRUE)
+# write.xlsx(corrected_matrix, file.path(data_dir, "07_ComBat_Corrected_Matrix.xlsx"), rowNames = TRUE)
+```
+
+# STEP 12: Visualization Analysis Before/After Correction (PCA)
+
+```{r DMSO&Pool Groop}
+# PCA on Corrected Matrix (DMSO & Pool Group)
+pca_res_corrected <- prcomp(t(corrected_matrix), scale. = TRUE)
+pca_data_corrected <- as.data.frame(pca_res_corrected$x) %>%
+  rownames_to_column("FullSampleName") %>%
+  left_join(sample_info, by = "FullSampleName")
+
+percent_variance_corrected <- round(100 * pca_res_corrected$sdev^2 / sum(pca_res_corrected$sdev^2), 1)
+pca_data_corrected <- pca_data_corrected %>%
+  mutate(Group = case_when(
+    str_detect(tolower(SampleType), "dmso") ~ "DMSO",
+    str_detect(tolower(SampleType), "pool") ~ "Pool",
+    TRUE                                     ~ "Drug Treatment"))
+
+p_pca_groups <- ggplot(pca_data_corrected, aes(x = PC1, y = PC2)) +
+  geom_point(
+    data = pca_data_corrected %>% filter(Group == "Drug Treatment"),
+    color = "#e5e5e5",
+    size  = 2,
+    alpha = 0.6
+  ) +
+  geom_point(
+    data = pca_data_corrected %>% filter(Group %in% c("DMSO", "Pool")),
+    aes(color = Group),
+    size = 3
+  ) +
+  stat_ellipse(
+    data = pca_data_corrected %>% filter(Group %in% c("DMSO", "Pool")),
+    aes(color = Group),
+    type  = "norm", 
+    level = 0.95, 
+    size  = 1
+  ) +
+  scale_color_manual(values = c("DMSO" = "#CC79A7", "Pool" = "#009E73")) +
+  labs(
+    title    = "PCA Plot (After Batch Correction)",
+    subtitle = "95% confidence ellipses for DMSO and Pool samples",
+    x = paste0("PC1 (", percent_variance_corrected[1], "% variance)"),
+    y = paste0("PC2 (", percent_variance_corrected[2], "% variance)"),
+    color = "Group"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "right"
+  ) + theme(aspect.ratio = 1)
+
+print(p_pca_groups)
+
+# PCA Comparison Before/After ComBat
+plot_pca_custom <- function(mat, info, title) {
+  pca <- prcomp(t(mat), scale. = TRUE)
+  pct <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+  df <- as.data.frame(pca$x) %>%
+    rownames_to_column("FullSampleName") %>%
+    left_join(info, by = "FullSampleName")
+  
+  batches <- sort(unique(df$Batch))
+  sorted <- batches[order(as.numeric(str_extract(batches, "\\d+")))]
+  df$Batch <- factor(df$Batch, levels = sorted)
+  
+  ggplot(df, aes(x = PC1, y = PC2, color = Batch)) +
+    geom_point(size = 2, alpha = 1) +
+    labs(title = title, x = paste0("PC1 (", pct[1], "%)"), y = paste0("PC2 (", pct[2], "%)"))+
+    theme_bw()
+}
+
+p_before <- plot_pca_custom(dmso_corrected_matrix, sample_info, "Before ComBat") + theme(legend.position = "bottom")
+p_after <- plot_pca_custom(corrected_matrix, sample_info, "After ComBat") + theme(legend.position = "bottom")
+
+combined_pca <- p_before + p_after + plot_layout(guides = "collect") + theme(aspect.ratio = 1)
+print(combined_pca)
+```
+# optional
+
+```{r}
+plot_pca_custom <- function(mat, info, title) {
+  info_nopool <- info %>%
+    filter(!str_detect(tolower(SampleType), "pool"))
+  keep_samples <- intersect(colnames(mat), info_nopool$FullSampleName)
+  mat_sub  <- mat[, keep_samples, drop = FALSE]
+  info_sub <- info_nopool %>% filter(FullSampleName %in% keep_samples)
+  pca <- prcomp(t(mat_sub), scale. = TRUE)
+  pct <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+  
+  df <- as.data.frame(pca$x) %>%
+    rownames_to_column("FullSampleName") %>%
+    left_join(info_sub, by = "FullSampleName")
+  batches <- sort(unique(df$Batch))
+  sorted  <- batches[order(as.numeric(str_extract(batches, "\\d+")))]
+  df$Batch <- factor(df$Batch, levels = sorted)
+  
+  ggplot(df, aes(x = PC1, y = PC2, color = Batch)) +
+    geom_point(size = 2, alpha = 1) +
+    labs(
+      title = title,
+      x = paste0("PC1 (", pct[1], "%)"),
+      y = paste0("PC2 (", pct[2], "%)")
+    ) +
+    theme_bw()
+}
+
+p_before <- plot_pca_custom(dmso_corrected_matrix, sample_info, "Before ComBat") +
+  theme(legend.position = "bottom")
+
+p_after  <- plot_pca_custom(corrected_matrix,      sample_info, "After ComBat") +
+  theme(legend.position = "bottom")
+
+combined_pca <- p_before + p_after + plot_layout(guides = "collect")+theme(aspect.ratio = 1)
+
+print(combined_pca)
+#ggsave(file.path(fig_dir, "05_combinedPCA after batch correction_nopool.pdf"), combined_pca, width = 14, height = 7)
+```
+
+# STEP 13: Quality Control: Correlation Assessment (Pool / Technical / Biological Replicates)
+
+```{r}
+full_sample_cor_matrix <- cor(corrected_matrix, method = "spearman")
+
+full_metadata <- tibble(
+  FullName = colnames(corrected_matrix)
+) %>%
+  left_join(sample_info, by = c("FullName" = "FullSampleName")) %>%
+  mutate(
+    BaseDrugName = str_remove(str_extract(FullName, "(?<=_).*$"), "R$"),
+    IsTechRep = str_ends(FullName, "R"),
+    Category = case_when(
+      str_detect(tolower(SampleType), "pool") ~ "Pool",
+      str_detect(tolower(SampleType), "dmso") ~ "DMSO",
+      TRUE                                     ~ "Drug"
+    )
+  )
+
+## 1. Pool Sample Correlation --------------------------------------------------------
+
+pool_samples   <- full_metadata %>%
+  filter(Category == "Pool") %>%
+  pull(FullName)
+
+pool_cor_subset <- full_sample_cor_matrix[pool_samples, pool_samples]
+pool_cor_values <- pool_cor_subset[upper.tri(pool_cor_subset)]
+median_pool_cor <- median(pool_cor_values)
+
+cat("\n--- 1. Pool Sample QC (Platform Stability) ---\n")
+cat(paste("Found", length(pool_samples), "Pool samples.\n"))
+cat(paste("Median Correlation:", round(median_pool_cor, 4), "\n"))
+if (median_pool_cor > 0.95) cat("Assessment: Excellent, platform stability is very high.\n")
+
+# Sort Pool samples by Batch number
+pool_order <- full_metadata %>%
+  filter(Category == "Pool") %>%
+  mutate(Batch_num = as.numeric(str_extract(Batch, "\\d+"))) %>%
+  arrange(Batch_num) %>%
+  pull(FullName)
+
+pool_cor_sorted <- pool_cor_subset[pool_order, pool_order]
+
+# Corrplot visualization
+pdf(file.path(fig_dir, "08_Pool_Correlation.pdf"), width = 20, height = 10)
+corrplot(
+  pool_cor_sorted,
+  method  = "circle",
+  type    = "upper",
+  order   = "original",
+  col     = colorRampPalette(c("#3462ae", "white", "#9e539d"))(100),
+  tl.col  = "black",
+  tl.srt  = 90,
+  tl.cex  = 0.8,
+  diag    = FALSE,
+  addgrid.col   = "grey90",
+  addCoef.col   = "black",
+  number.cex    = 0.4,
+  number.digits = 2,
+  title         = "Correlation of Pool Samples",
+  mar           = c(0, 0, 2, 0)
+)
+dev.off()
+
+## 2. Technical Replicate Correlation --------------------------------------------------------
+
+base_samples     <- full_metadata %>% filter(Category == "Drug", !IsTechRep)
+tech_rep_samples <- full_metadata %>% filter(Category == "Drug",  IsTechRep)
+
+tech_replicates_pairs <- inner_join(
+  base_samples, tech_rep_samples,
+  by = c("Batch", "BaseDrugName"),
+  suffix = c("_base", "_rep")
+)
+
+tech_replicates_cor <- tech_replicates_pairs %>%
+  rowwise() %>%
+  mutate(
+    Correlation = full_sample_cor_matrix[FullName_base, FullName_rep]
+  ) %>%
+  ungroup() %>%
+  na.omit()
+
+median_tech_rep_cor <- median(tech_replicates_cor$Correlation)
+
+cat("\n--- 2. Technical Replicate QC (Processing Stability) ---\n")
+cat(paste("Found", nrow(tech_replicates_cor), "technical replicate pairs.\n"))
+cat(paste("Median Correlation:", round(median_tech_rep_cor, 4), "\n"))
+if (median_tech_rep_cor > 0.90) cat("Assessment: Excellent, processing workflow highly reproducible.\n")
+
+## 3. Biological Replicate Correlation ------------------------------------------------------
+
+drug_samples_meta <- full_metadata %>% filter(Category == "Drug")
+
+bio_replicates_pairs <- drug_samples_meta %>%
+  inner_join(drug_samples_meta, by = "BaseDrugName", suffix = c("1", "2")) %>%
+  filter(FullName1 < FullName2) %>%  
+  filter(Batch1   != Batch2)  
+
+bio_replicates_cor <- bio_replicates_pairs %>%
+  rowwise() %>%
+  mutate(
+    Correlation = full_sample_cor_matrix[FullName1, FullName2]
+  ) %>%
+  ungroup() %>%
+  na.omit()
+
+median_bio_rep_cor <- median(bio_replicates_cor$Correlation)
+
+cat("\n--- 3. Biological Replicate QC (Overall Experimental Stability) ---\n")
+cat(paste("Found", nrow(bio_replicates_cor), "biological replicate pairs.\n"))
+cat(paste("Median Correlation:", round(median_bio_rep_cor, 4), "\n"))
+if (median_bio_rep_cor > 0.75) cat("Assessment: Excellent, high consistency across batches.\n")
+
+## 4. Comprehensive QC Violin Plot ------------------------------------------------------
+
+qc_data_pool <- tibble(Correlation = pool_cor_values, Type = "Pool vs. Pool")
+qc_data_tech <- tibble(Correlation = tech_replicates_cor$Correlation, Type = "Technical Replicates")
+qc_data_bio  <- tibble(Correlation = bio_replicates_cor$Correlation, Type = "Biological Replicates")
+
+combined_qc_data <- bind_rows(qc_data_pool, qc_data_tech, qc_data_bio) %>%
+  mutate(Type = factor(Type, levels = c("Pool vs. Pool", "Technical Replicates", "Biological Replicates")))
+
+p_cor_violin <- ggplot(combined_qc_data, aes(x = Type, y = Correlation, fill = Type)) +
+  geom_violin(trim = FALSE, alpha = 0.8) +
+  geom_boxplot(width = 0.15, fill = "white", outlier.size = 1) +
+  labs(
+    title    = "Comprehensive Quality Control via Sample Correlation",
+    subtitle = "Distribution of Spearman correlations for different replicate types",
+    x        = "Comparison Type",
+    y        = "Spearman Correlation"
+  ) +
+  scale_fill_manual(values = c(
+    "Pool vs. Pool"         = "#009E73",
+    "Technical Replicates"  = "#F0E442",
+    "Biological Replicates" = "#0072B2"
+  )) +
+  stat_summary(fun = median, geom = "text", aes(label = sprintf("%.3f", ..y..)), vjust = -0.5, size = 4.5, color = "black") +
+  theme_bw(base_size = 16) +
+  theme(axis.text.x = element_text(angle = 10, hjust = 1), legend.position = "none") +
+  coord_cartesian(ylim = c(floor(min(combined_qc_data$Correlation) * 10) / 10, 1.0))
+
+print(p_cor_violin)
+
+## 5. Pool Correlation Heatmap ------------------------------------------------------
+
+cor_long <- melt(pool_cor_sorted, varnames = c("Sample1", "Sample2"), value.name = "Correlation")
+cor_long$Sample1 <- factor(cor_long$Sample1, levels = pool_order)
+cor_long$Sample2 <- factor(cor_long$Sample2, levels = pool_order)
+
+p_pool_heat <- ggplot(cor_long, aes(x = Sample1, y = Sample2, fill = Correlation)) +
+  geom_tile(color = "grey90") +
+  scale_fill_gradient2(low = "#3462ae", mid = "white", high = "#9e539d", midpoint = 0.8, limits = c(0.6, 1), name = "Spearman r") +
+  coord_fixed() +
+  labs(title = sprintf("Correlation of Pool Samples (median = %.3f)", median_pool_cor), x = NULL, y = NULL) +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6), axis.text.y = element_text(size = 6), panel.grid = element_blank()) + theme(aspect.ratio = 1)
+
+print(p_pool_heat)
+```
+
+# STEP 14: QC Based on CV (Pool / Technical / Biological Replicates)
+
+```{r}
+linear_matrix <- 2^corrected_matrix
+cat("Data converted back to linear scale for CV calculation.\n")
+
+calculate_cv <- function(x) {
+  mean_x <- mean(x, na.rm = TRUE)
+  if (mean_x == 0) return(NA)
+  (sd(x, na.rm = TRUE) / mean_x) * 100
+}
+
+## 1. Pool Sample CV --------------------------------------------------------
+
+pool_samples      <- full_metadata %>% filter(Category == "Pool") %>% pull(FullName)
+pool_linear_subset <- linear_matrix[, pool_samples]
+pool_cv_values <- apply(pool_linear_subset, 1, calculate_cv) %>% na.omit()
+median_pool_cv <- median(pool_cv_values)
+
+cat("\n--- 1. Pool Sample CV (Platform Precision) ---\n")
+cat(paste("Median CV (%):", round(median_pool_cv, 2), "%\n"))
+
+## 2. Technical Replicate CV ---------------------------------------------------------
+
+tech_rep_cv_list <- list()
+for (i in 1:nrow(tech_replicates_pairs)) {
+  pair <- tech_replicates_pairs[i, ]
+  sample_names     <- c(pair$FullName_base, pair$FullName_rep)
+  pair_linear_data <- linear_matrix[, sample_names]
+  tech_rep_cv_list[[i]] <- apply(pair_linear_data, 1, calculate_cv)
+}
+tech_rep_cv_values <- unlist(tech_rep_cv_list) %>% na.omit()
+median_tech_rep_cv <- median(tech_rep_cv_values)
+
+cat("\n--- 2. Technical Replicate CV (Processing Precision) ---\n")
+cat(paste("Median CV (%):", round(median_tech_rep_cv, 2), "%\n"))
+
+## 3. Biological Replicate CV -------------------------------------------------------
+
+replicated_drugs <- drug_samples_meta %>% group_by(BaseDrugName) %>% filter(n() > 1) %>% distinct(BaseDrugName) %>% pull(BaseDrugName)
+
+bio_rep_cv_list <- list()
+for (drug in replicated_drugs) {
+  sample_names <- drug_samples_meta %>% filter(BaseDrugName == drug) %>% pull(FullName)
+  group_linear_data <- linear_matrix[, sample_names]
+  bio_rep_cv_list[[drug]] <- apply(group_linear_data, 1, calculate_cv)
+}
+bio_rep_cv_values <- unlist(bio_rep_cv_list) %>% na.omit()
+median_bio_rep_cv <- median(bio_rep_cv_values)
+
+cat("\n--- 3. Biological Replicate CV (Overall Experimental Precision) ---\n")
+cat(paste("Median CV (%):", round(median_bio_rep_cv, 2), "%\n"))
+
+## 4. Comprehensive CV Violin Plot ------------------------------------------------------
+
+qc_cv_pool <- tibble(CV = pool_cv_values, Type = "Pool Samples")
+qc_cv_tech <- tibble(CV = tech_rep_cv_values, Type = "Technical Replicates")
+qc_cv_bio  <- tibble(CV = bio_rep_cv_values, Type = "Biological Replicates")
+
+combined_cv_data <- bind_rows(qc_cv_pool, qc_cv_tech, qc_cv_bio) %>%
+  mutate(Type = factor(Type, levels = c("Pool Samples", "Technical Replicates", "Biological Replicates")))
+
+p_cv_violin <- ggplot(combined_cv_data, aes(x = Type, y = CV, fill = Type)) +
+  geom_violin(trim = FALSE, alpha = 0.8) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  labs(
+    title    = "Comprehensive Quality Control via Coefficient of Variation (CV)",
+    subtitle = "CV calculated on linear-scale data. Lower CV indicates higher precision.",
+    x        = "Comparison Type",
+    y        = "Coefficient of Variation (%)"
+  ) +
+  scale_fill_manual(values = c("Pool Samples" = "#009E73", "Technical Replicates" = "#F0E442", "Biological Replicates" = "#0072B2")) +
+  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1), legend.position = "none") +
+  coord_cartesian(ylim = c(0, 150)) +
+  stat_summary(fun = median, geom = "text", aes(label = paste0(round(..y.., 1), "%")), vjust = -0.5, size = 4)
+
+print(p_cv_violin)
+
+## Technical vs Biological Replicates Only -----------------------------------
+
+qc_cv_tech2 <- tibble(CV = tech_rep_cv_values, Type = "Technical Replicates")
+qc_cv_bio2  <- tibble(CV = bio_rep_cv_values,  Type = "Biological Replicates")
+
+combined_cv_data2 <- bind_rows(qc_cv_tech2, qc_cv_bio2) %>%
+  mutate(Type = factor(Type, levels = c("Technical Replicates", "Biological Replicates")))
+
+p_cv_tech_bio <- ggplot(combined_cv_data2, aes(x = Type, y = CV, fill = Type)) +
+  geom_violin(trim = FALSE, alpha = 0.8) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  labs(title = "CV of Technical vs Biological Replicates", y = "Coefficient of Variation (%)") +
+  scale_fill_manual(values = c("Technical Replicates" = "#3462ae", "Biological Replicates" = "#9e539d")) +
+  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1), legend.position = "none") +
+  coord_cartesian(ylim = c(0, 110)) +
+  stat_summary(fun = median, geom = "text", aes(label = paste0(round(..y.., 1), "%")), vjust = -0.5, size = 4) + theme(aspect.ratio = 1)
+
+print(p_cv_tech_bio)
+#write.xlsx(combined_cv_data2, file.path(data_dir, "Plot04_combined_cv_data2.xlsx"))
+#ggsave(file.path(fig_dir, "04_cv of technical and Biological replicates.pdf"), p_cv_tech_bio, width = 7, height = 7)
+```
+
+# STEP 15: Log2FC Calculation (Global DMSO Median)
+
+```{r}
+all_dmso_samples <- sample_info %>% filter(str_detect(tolower(SampleType), "dmso")) %>% pull(FullSampleName)
+all_drug_samples_info <- sample_info %>% filter(!str_detect(tolower(SampleType), "pool|dmso"))
+
+corrected_dmso_matrix <- corrected_matrix[, all_dmso_samples]
+global_dmso_profile_corrected <- apply(corrected_dmso_matrix, 1, median, na.rm = TRUE)
+all_drug_sample_names <- all_drug_samples_info %>% pull(FullSampleName)
+corrected_drugs_matrix <- corrected_matrix[, all_drug_sample_names]
+
+l2fc_matrix_combat_global_dmso <- sweep(corrected_drugs_matrix, 1, global_dmso_profile_corrected, FUN = "-")
+short_drug_names <- paste(all_drug_samples_info$Batch, all_drug_samples_info$SampleType, sep="_")
+colnames(l2fc_matrix_combat_global_dmso) <- short_drug_names
+
+# write.xlsx(l2fc_matrix_combat_global_dmso, file.path(data_dir, "09_Log2FC_Global_DMSO_Median.xlsx"), rowNames=TRUE)
+```
+
+# STEP 16: Log2FC Replicate Correlation (Technical & Biological)
+
+```{r}
+final_l2fc_matrix <- l2fc_matrix_combat_global_dmso
+
+# Correlation matrix of Log2FC
+l2fc_cor_matrix <- cor(final_l2fc_matrix, method = "spearman", use = "pairwise.complete.obs")
+
+# Technical Replicates on Log2FC
+tech_replicates_cor_l2fc <- tech_replicates_pairs %>%
+  rowwise() %>% mutate(Correlation_l2fc = l2fc_cor_matrix[FullName_base, FullName_rep]) %>% ungroup() %>% na.omit()
+median_tech_rep_cor_l2fc <- median(tech_replicates_cor_l2fc$Correlation_l2fc)
+
+cat("\n--- Technical Replicate Correlation on Log2FC Matrix ---\n")
+cat("Pairs:", nrow(tech_replicates_cor_l2fc), "\n")
+cat("Median Correlation:", round(median_tech_rep_cor_l2fc, 4), "\n")
+
+# Biological Replicates on Log2FC
+bio_replicates_cor_l2fc <- bio_replicates_pairs %>%
+  rowwise() %>% mutate(Correlation_l2fc = l2fc_cor_matrix[FullName1, FullName2]) %>% ungroup() %>% na.omit()
+median_bio_rep_cor_l2fc <- median(bio_replicates_cor_l2fc$Correlation_l2fc)
+
+cat("\n--- Biological Replicate Correlation on Log2FC Matrix ---\n")
+cat("Pairs:", nrow(bio_replicates_cor_l2fc), "\n")
+cat("Median Correlation:", round(median_bio_rep_cor_l2fc, 4), "\n")
+
+# Violin Plot
+qc_rep_corr <- bind_rows(
+  tech_replicates_cor_l2fc %>% transmute(Type = "Technical Replicates", Correlation = Correlation_l2fc),
+  bio_replicates_cor_l2fc %>% transmute(Type = "Biological Replicates", Correlation = Correlation_l2fc)
+) %>% mutate(Type = factor(Type, levels = c("Technical Replicates", "Biological Replicates")))
+
+p_l2fc_qc <- ggplot(qc_rep_corr, aes(x = Type, y = Correlation, fill = Type)) +
+  geom_violin(trim = FALSE, alpha = 0.8, scale = "width") +
+  geom_boxplot(width = 0.12, fill = "white", outlier.shape = NA, alpha = 0.9) +
+  scale_fill_manual(values = c("Technical Replicates" = "#3462ae", "Biological Replicates" = "#9e539d")) +
+  stat_summary(fun = median, geom = "text", aes(label = sprintf("%.3f", after_stat(y))), vjust = -0.8, size = 5, fontface = "bold") +
+  labs(title = "Replicate Correlation in Log2FC Matrix", subtitle = "QC assessment for technical and biological replicates", x = NULL, y = "Spearman Correlation") +
+  theme_bw() + theme(axis.text.x = element_text(size = 12), legend.position = "none", plot.title = element_text(face = "bold", size = 14)) +
+  coord_cartesian(ylim = c(0, 1.1)) + theme(aspect.ratio = 1)
+
+print(p_l2fc_qc)
+```
+
+# STEP 17: Absolute Log2FC Difference Analysis Between Biological Replicates
+
+```{r}
+# Metadata for L2FC matrix
+l2fc_metadata <- tibble(FullName = colnames(final_l2fc_matrix)) %>%
+  mutate(Batch = str_extract(FullName, "^[^_]+"), DrugPart = str_extract(FullName, "(?<=_).*$"),
+         BaseDrugName = str_remove(DrugPart, "R$"), IsTechRep = str_ends(DrugPart, "R"))
+
+# Find biological replicate pairs
+bio_rep_pairs <- l2fc_metadata %>%
+  inner_join(l2fc_metadata, by = "BaseDrugName", suffix = c("_1", "_2")) %>%
+  filter(FullName_1 < FullName_2, Batch_1 != Batch_2)
+
+cat("Found", nrow(bio_rep_pairs), "biological replicate pairs\n")
+
+# Calculate differences
+all_differences <- list()
+for(i in 1:nrow(bio_rep_pairs)) {
+  pair <- bio_rep_pairs[i, ]
+  l2fc_rep1 <- final_l2fc_matrix[, pair$FullName_1]
+  l2fc_rep2 <- final_l2fc_matrix[, pair$FullName_2]
+  abs_diff <- abs(l2fc_rep1 - l2fc_rep2)
+  all_differences[[i]] <- tibble(Protein = rownames(final_l2fc_matrix), Drug = pair$BaseDrugName, Rep1 = pair$FullName_1, Rep2 = pair$FullName_2, L2FC_Rep1 = l2fc_rep1, L2FC_Rep2 = l2fc_rep2, Abs_Difference = abs_diff)
+}
+
+diff_data <- bind_rows(all_differences) %>% filter(!is.na(Abs_Difference))
+
+# Statistics
+thresholds <- c(0.25, 0.5, 0.75, 1.0)
+for(thresh in thresholds) {
+  pct <- mean(diff_data$Abs_Difference > thresh) * 100
+  cat(sprintf("  > %.2f: %.2f%% (%d pairs)\n", thresh, pct, sum(diff_data$Abs_Difference > thresh)))
+}
+
+# Density Plot
+p_density <- ggplot(diff_data, aes(x = Abs_Difference)) +
+  geom_density(fill = "#3462ae", alpha = 0.6) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "red", size = 1) +
+  geom_vline(xintercept = median(diff_data$Abs_Difference), linetype = "solid", color = "#9e539d", size = 1) +
+  annotate("text", x = median(diff_data$Abs_Difference) + 0.02, y = Inf, vjust = 2, hjust = 0, label = paste0("Median = ", round(median(diff_data$Abs_Difference), 3)), color = "#9e539d", size = 4) +
+  labs(title = "Density of Log2FC Differences Between Biological Replicates", subtitle = paste0(sprintf("%.1f%%", mean(diff_data$Abs_Difference > 0.5) * 100), " of measurements differ by more than 0.5"), x = "Absolute Difference in Log2FC", y = "Density") +
+  theme_bw() + theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank()) + coord_cartesian(xlim = c(0, 2)) + theme(aspect.ratio = 1)
+
+print(p_density)
+
+# Summary Report
+cat("\n========== Biological Replicate Consistency Assessment Report ==========\n")
+cat(sprintf("Total protein-compound measurement pairs: %s\n", format(nrow(diff_data), big.mark = ",")))
+cat(sprintf("Median Log2FC Difference: %.4f\n", median(diff_data$Abs_Difference)))
+cat(sprintf("Proportion Difference <= 0.5: %.2f%%\n", mean(diff_data$Abs_Difference <= 0.5) * 100))
+cat(sprintf("Proportion Difference > 0.5: %.2f%%\n", mean(diff_data$Abs_Difference > 0.5) * 100))
+
+summary_stats <- tibble(Metric = c("Total protein-compound pairs", "Median absolute difference", "Mean absolute difference", "SD of difference", "% within 0.25", "% within 0.5", "% within 0.75", "% within 1.0"), Value = c(nrow(diff_data), round(median(diff_data$Abs_Difference), 4), round(mean(diff_data$Abs_Difference), 4), round(sd(diff_data$Abs_Difference), 4), round(mean(diff_data$Abs_Difference <= 0.25) * 100, 2), round(mean(diff_data$Abs_Difference <= 0.5) * 100, 2), round(mean(diff_data$Abs_Difference <= 0.75) * 100, 2), round(mean(diff_data$Abs_Difference <= 1.0) * 100, 2)))
+
+# write.xlsx(summary_stats, file.path(data_dir, "10_BioRep_L2FC_Difference_Summary_Stats.xlsx"))
+#write.xlsx(diff_data, file.path(data_dir, "Plot03_diff_data.xlsx"))
+#ggsave(file.path(fig_dir, "03_density of log2fc between BR.pdf"), p_density, width = 7, height = 7)
+```
+
+# STEP 18: Merge Replicates (Two-step averaging) to Generate Final Matrix
+
+```{r}
+full_metadata <- tibble(FullName = colnames(corrected_matrix)) %>% 
+  left_join(sample_info, by = c("FullName" = "FullSampleName")) %>% 
+  mutate(BaseDrugName = str_remove(str_extract(FullName, "(?<=_).*$"), "R$"),
+         IsTechRep = str_ends(FullName, "R"),
+         Category = case_when(str_detect(tolower(SampleType), "pool") ~ "Pool", str_detect(tolower(SampleType), "dmso") ~ "DMSO", TRUE ~ "Drug"),
+         GroupToMerge = case_when(Category == "Drug" ~ BaseDrugName, Category == "DMSO" ~ "DMSO_Control", Category == "Pool" ~ "Pool_Control"))
+
+unique_groups <- unique(full_metadata$GroupToMerge)
+cat(paste("Found", length(unique_groups), "independent groups for merging.\n"))
+
+merged_vectors_list <- list()
+for (group_name in unique_groups) {
+  replicate_cols <- full_metadata %>% filter(GroupToMerge == group_name) %>% pull(FullName)
+  replicates_subset_matrix <- corrected_matrix[, replicate_cols, drop = FALSE]
+  merged_vector <- rowMeans(replicates_subset_matrix, na.rm = TRUE)
+  merged_vectors_list[[group_name]] <- merged_vector
+}
+
+merged_matrix <- do.call(cbind, merged_vectors_list)
+
+cat("\n--- Replicate Merging Completed ---\n")
+print(paste("Original Matrix Dim:", paste(dim(corrected_matrix), collapse = " x ")))
+print(paste("Merged Matrix Dim:", paste(dim(merged_matrix), collapse = " x ")))
+
+# write.xlsx(merged_matrix, file.path(data_dir, "11_Merged_Matrix.xlsx"), rowNames=TRUE)
+```
+
+# STEP 19: Calculate Final Robust L2FC Matrix
+
+```{r}
+dmso_control_vector <- merged_matrix[, "DMSO_Control"]
+final_l2fc_matrix <- sweep(merged_matrix, 1, dmso_control_vector, FUN = "-")
+drug_columns <- setdiff(colnames(final_l2fc_matrix), c("DMSO_Control", "Pool_Control"))
+final_l2fc_matrix_drugs_only <- final_l2fc_matrix[, drug_columns]
+
+cat("--- Final L2FC Matrix Calculation Completed ---\n")
+print(paste("Final L2FC Matrix (Drugs Only) Dim:", paste(dim(final_l2fc_matrix_drugs_only), collapse = " x ")))
+print("Remaining Column Names Sample:")
+print(head(colnames(final_l2fc_matrix_drugs_only)))
+
+write.xlsx(final_l2fc_matrix_drugs_only, file.path(data_dir, "12_Final_L2FC_Matrix_Drugs_Only_367.xlsx"), rowNames=TRUE)
+cat("\n>>> Data processing Successfully <<<\n")
+```
+
+
+
+# Figure S1A_Sankey plot
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggalluvial)
+library(tidyr)
+library(openxlsx)
+
+# Load data
+df <- read.xlsx(file.path(input_dir, "Sankey_Plot.xlsx")) 
+
+# Step 1: Preprocessing ----
+data_sankey <- df %>%
+  # Convert to long format first
+  separate_rows(Pathways, sep = ";") %>%
+  to_lodes_form(
+    axes = c("Class1", "Drug", "Class2", "Class3", "Pathways"),
+    key = "layer",
+    id = "id"
+  ) %>%
+  # Regenerate Class1 column
+  mutate(
+    Class1 = if_else(layer == "Class1", stratum, NA_character_)
+  ) %>%
+  # Fill Class1 values by id
+  group_by(id) %>%
+  fill(Class1, .direction = "downup") %>%  # Bi-directional fill to ensure coverage
+  ungroup() %>%
+  mutate(Class1 = factor(Class1))  # Convert to factor
+
+
+# Step 2: Calculate proportions correctly ----
+layer_totals <- data_sankey %>%
+  group_by(layer) %>%
+  summarise(total = n())
+
+data_sankey <- data_sankey %>%
+  group_by(layer, stratum) %>%
+  mutate(percent = n() / layer_totals$total[layer_totals$layer == cur_group()$layer] * 100) %>%
+  ungroup()
+
+# Step 3: Highlight target category ----
+highlight_class <- "RTK"
+highlight_layer <- "Class2"
+
+# Get full flow paths for the highlighted IDs
+highlight_ids <- data_sankey %>% 
+  filter(layer == highlight_layer & stratum == highlight_class) %>% 
+  pull(id) %>% 
+  unique()
+
+# Step 4: Plot Optimization ----
+n_categories <- data_sankey %>% 
+  pull(Class1) %>% 
+  na.omit() %>%
+  unique() %>% 
+  length()
+
+# Generate purple gradient
+purple_gradient <- colorRampPalette(
+  c("#9b9ac1",  "#c2c8d8", "#b7a6c7", "#cabad7")  # Light to dark purple palette
+)(n_categories)
+
+# Main Plot Code
+p <- ggplot(data_sankey, aes(x = layer, stratum = stratum, alluvium = id)) +
+  geom_flow(
+    aes(fill = Class1),
+    width = 0.25,
+    alpha = 0.15,
+    color = "grey80",
+    curve_type = "cubic"
+  ) +
+  geom_flow(
+    data = data_sankey %>% filter(id %in% highlight_ids),
+    aes(fill = Class1),
+    width = 0.25,
+    alpha = 0.6,
+    color = "red",
+    curve_type = "cubic"
+  ) +
+  geom_stratum(
+    aes(fill = Class1),
+    width = 0.3,
+    alpha = 0.6,
+    color = "NA"
+  ) +
+  geom_stratum(
+    data = data_sankey %>% filter(stratum == highlight_class),
+    aes(fill = Class1),
+    width = 0.3,
+    alpha = 0.9,
+    color = "red",
+    linewidth = 0.1
+  ) +
+  geom_text(
+    stat = "stratum",
+    aes(label = ifelse(percent > 1, 
+                       paste0(stratum, "\n", round(percent,1), "%"), 
+                       NA)),
+    size = 2.8,
+    color = "black",
+    vjust = -0.6,
+    lineheight = 0.8
+  ) +
+  # Purple gradient scale
+  scale_fill_manual(
+    values = purple_gradient,
+    na.value = "#D0D2D4",
+    guide = guide_legend(
+      title = "Class 1",
+      override.aes = list(alpha = 0.8, color = "gray30")
+    )
+  )  +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 13)
+  )
+p
+
+#### Proportion Calculation and Export ----
+library(writexl)  
+
+# Generate hierarchical percentage summary table
+percentage_summary <- data_sankey %>%
+  # Group by layer and stratum
+  group_by(layer, stratum) %>%
+  # Extract unique values to avoid duplicate counting
+  summarise(
+    percent = first(percent),  # Percentage pre-calculated
+    Class1 = first(Class1),    # Associated Class1
+    .groups = "drop"
+  ) %>%
+  # Sort by layer and percentage
+  arrange(layer, desc(percent)) %>%
+  # Rename columns to English
+  rename(
+    "Category_Layer" = layer,
+    "Specific_Category" = stratum,
+    "Percentage_Percent" = percent,
+    "Primary_Class" = Class1
+  )
+
+library(readr)
+# Export to CSV (Statistics of proportions for each category)
+write_excel_csv(
+  percentage_summary, 
+  file = file.path(data_dir, "Drug_Classification_Proportions.csv"),
+  na = ""  # Replace NA with empty string
+)
+```
+
+# Figure 1A
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(cluster)
+library(rcdk)
+library(factoextra)
+library(itertools)
+library(pvclust)
+library(dendextend)
+library(circlize)
+library(here)
+
+# https://jcheminf.biomedcentral.com/track/pdf/10.1186/s13321-019-0405-0.pdf
+
+#### 1. Import Files ####
+# Using GB18030 encoding to prevent errors with special characters (like ±)
+smiles_367 <- read.delim(file.path(input_dir, "367drugs.smiles.txt"), header = FALSE, fileEncoding = "GB18030")
+colnames(smiles_367) <- c("smiles", "drug", "drug_first")
+rownames(smiles_367) <- smiles_367$drug
+
+mols <- parse.smiles(smiles_367$smiles)
+names(mols) <- rownames(smiles_367)
+
+## Get fingerprints
+# 'extended' type as suggested by Voicu et al.
+fp <- lapply(mols, get.fingerprint, type = 'extended') 
+fp.sim <- fingerprint::fp.sim.matrix(fp, method = 'tanimoto')
+fp.dist <- 1 - fp.sim
+
+rownames(fp.dist) <- rownames(smiles_367)
+colnames(fp.dist) <- rownames(smiles_367)
+
+#### 2. Evaluate Optimal Clustering Values ####
+
+# Clustering Method 1: Gap Statistic
+# Adjusting k.max; a higher number of clusters often appears slightly better
+fviz_nbclust(fp.dist, hcut, diss = T, method = "gap_stat", k.max = 300)
+
+# ============================================================
+# Extract optimal k from fviz_nbclust results across different k.max
+kmax_values <- c(20, 50, 80, 100, 150, 200, 250)
+optimal_k <- c()
+
+cat("Calculating optimal k for different k.max values...\n")
+
+for (kmax in kmax_values) {
+  result <- fviz_nbclust(fp.dist, hcut, diss = TRUE, 
+                         method = "gap_stat", k.max = kmax)
+  
+  # Extract data from ggplot object
+  plot_data <- result$data
+  best_k <- which.max(plot_data$gap)
+  optimal_k <- c(optimal_k, best_k)
+  cat("  k.max =", kmax, "→ optimal k =", best_k, "\n")
+}
+
+# Bind results
+result_df <- data.frame(k_max = kmax_values, optimal_k = optimal_k)
+
+p <- ggplot(result_df, aes(x = k_max, y = optimal_k)) +
+  geom_line(color = "red", linewidth = 1.5) +
+  geom_point(color = "red", size = 4) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  annotate("text", x = 120, y = 80,
+           label = "Optimal k ≈ k.max\n→ Does not converge\n→ No natural clusters",
+           size = 4.5, color = "red") +
+  labs(title = "Gap Statistic: Optimal k vs k.max",
+       subtitle = "Optimal k increases linearly with k.max → No convergence",
+       x = "k.max (maximum clusters tested)",
+       y = "Optimal k (suggested by Gap statistic)") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+print(p)
+
+
+# Clustering Method 2: Silhouette
+k_values <- 2:366
+
+results <- data.frame(k = k_values, silhouette = NA)
+for (i in seq_along(k_values)) {
+  k <- k_values[i]
+  hc <- hclust(as.dist(fp.dist), method = "complete")
+  clusters <- cutree(hc, k = k)
+  sil <- silhouette(clusters, as.dist(fp.dist))
+  results$silhouette[i] <- mean(sil[, 3])
+  
+  if (k %% 50 == 0) cat("  k =", k, "completed\n")
+}
+
+# Identify best k
+best_k <- results$k[which.max(results$silhouette)]
+best_sil <- max(results$silhouette)
+
+# Silhouette plot
+q <- ggplot(results, aes(x = k, y = silhouette)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(data = results[results$k == best_k, ], 
+             aes(x = k, y = silhouette),
+             color = "red", size = 4) +
+  geom_vline(xintercept = best_k, linetype = "dashed", color = "red") +
+  annotate("text", x = best_k + 10, y = best_sil, 
+           label = paste0("Optimal k = ", best_k, "\n(", 
+                          round(367/best_k, 1), " drugs/cluster)"),
+           hjust = 0, color = "red", size = 4) +
+  annotate("text", x = 150, y = 0.15,
+           label = "Optimal k = 220 (≈1.7 drugs/cluster),\nindicating that no small number of well-separated structure-based clusters can be identified.",
+           size = 4, color = "gray40") +
+  labs(title = "Chemical Structure-based Clustering of 367 Anticancer Drugs",
+       subtitle = "Silhouette analysis reveals lack of natural cluster structure",
+       x = "Number of Clusters (k)",
+       y = "Average Silhouette Width") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        plot.subtitle = element_text(size = 11, color = "gray40"))
+
+print(q)
+
+
+#### 3. Evaluate Clustering Stability ####
+
+# Evaluate branch stability via Bootstrap
+drug_clust_boot <- pvclust(fp.dist, method.hclust = "complete",
+                           method.dist = "euclidean", nboot = 100,
+                           iseed = 2248)
+
+k_220 <- cutree(drug_clust_boot, k = 220, order_clusters_as_data = FALSE)
+
+
+#### 4. Plotting Preliminary Drug Clusters vs ATC Codes ####
+# Drug information (ATC classes)
+drug_meta <- read.csv(file.path(input_dir, "Drugs_sampleinfo_367.csv"), row.names = 1) 
+drug_meta <- merge(drug_meta, smiles_367, by.x = "Drug_first",
+                   by.y = "drug_first", all.x = T) %>%
+  mutate(ATC_colours = case_when(str_detect(Level_1, 'A') ~ '#f4c40f',
+                                 str_detect(Level_1, 'B') ~ '#fe9b00',
+                                 str_detect(Level_1, 'C') ~ '#d8443c',
+                                 str_detect(Level_1, 'D') ~ '#9b3441',
+                                 str_detect(Level_1, 'G') ~ '#de597c',
+                                 str_detect(Level_1, 'H') ~ '#F0A8B2',
+                                 str_detect(Level_1, 'J') ~ '#aa7aa1',
+                                 str_detect(Level_1, 'L') ~ '#9f5691',
+                                 str_detect(Level_1, 'M') ~ '#633372',
+                                 str_detect(Level_1, 'N') ~ '#1f6e9c',
+                                 str_detect(Level_1, 'R') ~ '#2b9b81',
+                                 str_detect(Level_1, 'S') ~ '#92c051',
+                                 str_detect(Level_1, 'V') ~ 'black',
+                                 str_detect(Level_1, 'P') ~ 'red',
+                                 TRUE ~ 'grey'))
+
+drug_meta <- drug_meta[match(names(k_220), drug_meta$Drug_first), ]
+drug_meta$ATC_colours[is.na(drug_meta$ATC_colours)] <- "grey"
+
+# Define Legend
+library(dendextend)
+library(circlize)
+
+# Prepare mapping data
+class <- c('A', 'B', 'C', 'D', 'G', 'H', 'J', 'L', 
+           'M', 'N', 'R', 'S', 'P', 'V', "NA")
+colours <- c('#f4c40f','#fe9b00','#d8443c','#9b3441','#de597c','#F0A8B2',
+             '#aa7aa1','#9f5691','#633372','#1f6e9c','#2b9b81','#92c051',
+             'red','black', 'grey')
+
+dend <- as.dendrogram(drug_clust_boot)
+
+
+dend_styled <- dend %>%
+  set("leaves_pch", NA) %>%           # Set leaf shape to NA (hidden)
+  set("leaves_cex", 0) %>%            # Set leaf size to 0
+  set("labels_cex", 0) %>%            # Hide original labels (drawn manually)
+  color_branches(k = 220) %>%
+  pvclust_show_signif(
+    drug_clust_boot,
+    alpha         = 0.05,
+    signif_type   = "au",
+    lwd_signif    = 0.04,
+    lwd_nonsignif = 0.01
+  )
+
+n_leaves <- nleaves(dend)
+leaf_labels <- labels(dend)
+leaf_colors <- drug_meta$ATC_colours[match(leaf_labels, drug_meta$Drug_first)]
+leaf_colors[is.na(leaf_colors)] <- "grey"
+
+# ============================================================
+# Start Plotting
+# ============================================================
+
+pdf(file.path(fig_dir, "Figure1A_drugstructure_hclust_circlize_k220_manual.pdf"), width = 20, height = 17)
+
+circos.clear()
+
+circos.par(
+  cell.padding = c(0, 0, 0, 0),
+  track.margin = c(0, 0),
+  start.degree = 90,
+  gap.degree = 0,
+  canvas.xlim = c(-1.2, 1.2),
+  canvas.ylim = c(-1.2, 1.2)
+)
+
+circos.initialize(factors = "a", xlim = c(0, n_leaves))
+
+# Track 1: Labels
+circos.track(
+  ylim = c(0, 1),
+  track.height = 0.04,
+  bg.border = NA,
+  panel.fun = function(x, y) {
+    for (i in 1:n_leaves) {
+      x_pos <- i - 0.5
+      circos.text(
+        x = x_pos,
+        y = 0.5,
+        labels = leaf_labels[i],
+        facing = "clockwise",
+        niceFacing = TRUE,
+        adj = c(0, 0.5),
+        cex = 0.8
+      )
+    }
+  }
+)
+
+# Track 2: Leaf points (The colored ring)
+circos.track(
+  ylim = c(0, 1),
+  track.height = 0.03,
+  bg.border = NA,
+  panel.fun = function(x, y) {
+    for (i in 1:n_leaves) {
+      x_pos <- i - 0.5
+      circos.points(
+        x = x_pos,
+        y = 0.5,
+        pch = 19,
+        cex = 1,
+        col = leaf_colors[i]
+      )
+    }
+  }
+)
+
+# Track 3: Spacing
+circos.track(
+  ylim = c(0, 1),
+  track.height = 0.0005,
+  bg.border = NA
+)
+
+# Track 4: Dendrogram (Leaves are hidden here)
+circos.track(
+  ylim = c(0, attr(dend_styled, "height")),
+  track.height = 0.4,
+  bg.border = NA,
+  panel.fun = function(x, y) {
+    circos.dendrogram(
+      dend_styled,
+      facing = "outside"
+    )
+  }
+)
+
+legend("topleft",
+       legend = class,
+       fill   = colours,
+       cex    = 0.9,
+       ncol   = 2,
+       title  = "ATC Level-1 Class",
+       bty    = "n")
+
+
+dev.off()
+circos.clear()
+
+cat("PDF has been saved!\n")
+```
+

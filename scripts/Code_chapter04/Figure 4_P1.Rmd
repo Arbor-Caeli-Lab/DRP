@@ -1,0 +1,2999 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-06-07"
+---
+
+```{r}
+# ═════════════════════════════════════════════════════════════════════════
+source(file.path(knitr::current_input(dir = TRUE), "..", "_common", "repro_paths.R"))
+paths <- repro_paths("Code_chapter04")
+repo_root <- paths$repo_root
+input_dir <- paths$input_dir
+data_dir <- paths$results_dir
+fig_dir <- paths$results_dir
+folder_path <- input_dir
+
+load(file.path(input_dir, "Chapter 02.RData"))
+library(openxlsx)  
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(tidyverse)
+library(glmnet)
+library(randomForest)
+library(patchwork)
+library(pROC)
+library(readxl)
+
+
+set.seed(42)
+N_OUTER   <- 5     
+N_INNER   <- 5      
+FC_THRESHOLD <- if (exists("fc_threshold")) fc_threshold else 1.0
+```
+
+
+```{r PART 0: Data Preparation}
+
+inhibition_df <- read.xlsx(file.path(input_dir, "Inhibition.xlsx"), na.strings = c("NA", "not available"))
+
+compound_metrics <- data.frame(
+  Compound       = colnames(l2fc_matrix),
+  N_Regulated    = colSums(regulation_matrix_combined, na.rm = TRUE),
+  Mean_AbsL2FC   = colMeans(abs(l2fc_matrix), na.rm = TRUE),
+  Euclidean_Dist = sqrt(colSums(l2fc_matrix^2, na.rm = TRUE)),
+  N_Up           = colSums(l2fc_matrix > FC_THRESHOLD, na.rm = TRUE),
+  N_Down         = colSums(l2fc_matrix < -FC_THRESHOLD, na.rm = TRUE),
+  N_Extreme      = colSums(abs(l2fc_matrix) > 1.5, na.rm = TRUE)
+) %>%
+  mutate(
+    Up_Down_Ratio = log2((N_Up + 1) / (N_Down + 1)),
+    Pct_Regulated = N_Regulated / nrow(l2fc_matrix) * 100
+  )
+
+compound_metrics <- left_join(compound_metrics, inhibition_df, by = "Compound")
+
+
+conc_colname <- grep(
+  "Concentration|conc",
+  colnames(compound_metrics),
+  value = TRUE,
+  ignore.case = TRUE
+)[1]
+
+cat(sprintf("Detected concentration column name: %s\n", conc_colname))
+
+if (!is.null(conc_colname) && conc_colname != "Concentration") {
+  compound_metrics <- compound_metrics %>%
+    rename(Concentration = !!sym(conc_colname))
+}
+
+compound_metrics <- compound_metrics %>%
+  mutate(Log10_Conc = log10(Concentration))
+
+cat(sprintf("Total compounds: %d\n", nrow(compound_metrics)))
+cat(sprintf("With inhibition rate: %d\n", sum(!is.na(compound_metrics$Inhibition_Rate))))
+cat(sprintf(
+  "NA inhibition rate: %d (not measured / CCK-8 interference by color)\n",
+  sum(is.na(compound_metrics$Inhibition_Rate))
+))
+cat("\nConcentration distribution:\n")
+print(table(compound_metrics$Concentration))
+```
+
+
+```{r PART 1: Diagnostic for Concentration Confounding Effects}
+
+p_diag1 <- ggplot(
+  compound_metrics,
+  aes(x = factor(Concentration), y = Euclidean_Dist, fill = factor(Concentration))
+) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1.2) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Proteome Perturbation by Concentration",
+    x = "Drug Concentration (μM)",
+    y = "Euclidean Distance"
+  ) +
+  theme_bw() + theme(legend.position = "none")
+
+p_diag2 <- ggplot(
+  compound_metrics %>% filter(!is.na(Inhibition_Rate)),
+  aes(x = factor(Concentration), y = Inhibition_Rate, fill = factor(Concentration))
+) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1.2) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Inhibition Rate by Concentration",
+    x = "Drug Concentration (μM)",
+    y = "Inhibition Rate (%)"
+  ) +
+  theme_bw() + theme(legend.position = "none")
+
+print(p_diag1 | p_diag2)
+
+cat("\n── Per-concentration Spearman correlation (Euclidean_Dist vs Inhibition_Rate) ──\n")
+for (conc in sort(unique(compound_metrics$Concentration))) {
+  sub <- compound_metrics %>%
+    filter(Concentration == conc, !is.na(Inhibition_Rate))
+
+  if (nrow(sub) >= 10) {
+    ct <- cor.test(
+      sub$Euclidean_Dist,
+      sub$Inhibition_Rate,
+      method = "spearman",
+      exact = FALSE
+    )
+    cat(sprintf(
+      "  %5g μM: rho = %+.3f, p = %.2e, n = %d\n",
+      conc, ct$estimate, ct$p.value, nrow(sub)
+    ))
+  } else {
+    cat(sprintf("  %5g μM: n = %d (too few samples; skipped)\n", conc, nrow(sub)))
+  }
+}
+
+ct_raw <- cor.test(
+  compound_metrics$Euclidean_Dist,
+  compound_metrics$Inhibition_Rate,
+  method = "spearman",
+  exact = FALSE
+)
+
+cat(sprintf(
+  "\nOverall Spearman (not controlling for concentration): rho = %.3f, p = %.2e\n",
+  ct_raw$estimate, ct_raw$p.value
+))
+```
+
+
+```{r PART 2: Protein–Toxicity Partial Correlation (Controlled for Concentration}
+
+inhibition_vec <- compound_metrics$Inhibition_Rate
+conc_vec       <- compound_metrics$Log10_Conc
+
+partial_spearman <- function(x, y, z) {
+  valid <- complete.cases(x, y, z)
+  if (sum(valid) < 15) return(list(rho = NA, p = NA))
+  x <- x[valid]; y <- y[valid]; z <- z[valid]
+  rx <- rank(x); ry <- rank(y); rz <- rank(z)
+  res_x <- residuals(lm(rx ~ rz))
+  res_y <- residuals(lm(ry ~ rz))
+  ct <- cor.test(res_x, res_y, method = "pearson")  
+  return(list(rho = ct$estimate, p = ct$p.value))
+}
+
+protein_names <- rownames(l2fc_matrix)
+n_proteins <- length(protein_names)
+
+partial_results <- data.frame(
+  Protein     = protein_names,
+  Partial_rho = rep(NA_real_, n_proteins),
+  Partial_p   = rep(NA_real_, n_proteins),
+  Raw_rho     = rep(NA_real_, n_proteins),
+  Raw_p       = rep(NA_real_, n_proteins),
+  stringsAsFactors = FALSE
+)
+
+cat("Computing partial correlations...\n")
+pb <- txtProgressBar(min = 0, max = n_proteins, style = 3)
+
+for (i in seq_len(n_proteins)) {
+  prot_vals <- l2fc_matrix[i, ]
+  valid_raw <- !is.na(prot_vals) & !is.na(inhibition_vec)
+
+  if (sum(valid_raw) >= 15) {
+    ct_raw <- cor.test(
+      prot_vals[valid_raw],
+      inhibition_vec[valid_raw],
+      method = "spearman",
+      exact = FALSE
+    )
+    partial_results$Raw_rho[i] <- ct_raw$estimate
+    partial_results$Raw_p[i]   <- ct_raw$p.value
+  }
+
+  pc <- partial_spearman(prot_vals, inhibition_vec, conc_vec)
+  partial_results$Partial_rho[i] <- pc$rho
+  partial_results$Partial_p[i]   <- pc$p
+
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+partial_results <- partial_results %>%
+  mutate(
+    Raw_FDR     = p.adjust(Raw_p, method = "BH"),
+    Partial_FDR = p.adjust(Partial_p, method = "BH"),
+    Raw_Sig     = Raw_FDR < 0.05,
+    Partial_Sig = Partial_FDR < 0.05,
+    Direction_Partial = case_when(
+      Partial_Sig & Partial_rho > 0 ~ "Up → Kill (controlled)",
+      Partial_Sig & Partial_rho < 0 ~ "Down → Kill (controlled)",
+      TRUE ~ "Not significant"
+    )
+  ) %>%
+  arrange(Partial_p)
+
+cat(sprintf(
+  "\nSignificant proteins (raw; not controlling concentration): %d\n",
+  sum(partial_results$Raw_Sig, na.rm = TRUE)
+))
+cat(sprintf(
+  "Significant proteins (partial; concentration-controlled):  %d\n",
+  sum(partial_results$Partial_Sig, na.rm = TRUE)
+))
+
+both_sig     <- sum(partial_results$Raw_Sig & partial_results$Partial_Sig, na.rm = TRUE)
+only_raw     <- sum(partial_results$Raw_Sig & !partial_results$Partial_Sig, na.rm = TRUE)
+only_partial <- sum(!partial_results$Raw_Sig & partial_results$Partial_Sig, na.rm = TRUE)
+
+cat(sprintf(
+  "Both significant: %d | Only raw significant: %d | Only partial significant: %d\n",
+  both_sig, only_raw, only_partial
+))
+
+p_compare <- ggplot(
+  partial_results %>% filter(!is.na(Raw_rho), !is.na(Partial_rho)),
+  aes(x = Raw_rho, y = Partial_rho)
+) +
+  geom_point(aes(color = case_when(
+    Raw_Sig & Partial_Sig ~ "Both significant",
+    Raw_Sig & !Partial_Sig ~ "Lost after controlling conc",
+    !Raw_Sig & Partial_Sig ~ "Gained after controlling conc",
+    TRUE ~ "Neither"
+  )), alpha = 0.5, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c(
+    "Both significant" = "#e41a1c",
+    "Lost after controlling conc" = "#ff7f00",
+    "Gained after controlling conc" = "#377eb8",
+    "Neither" = "gray80"
+  ), name = "") +
+  labs(
+    title = "Impact of Controlling for Concentration",
+    x = "Raw Spearman ρ",
+    y = "Partial Spearman ρ (conc-controlled)"
+  ) +
+  theme_bw() + theme(aspect.ratio = 1, legend.position = "bottom")
+
+print(p_compare)
+
+p_volcano_partial <- ggplot(
+  partial_results,
+  aes(x = Partial_rho, y = -log10(Partial_FDR))
+) +
+  geom_point(aes(color = Direction_Partial), alpha = 0.5, size = 1.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_text_repel(
+    data = . %>% filter(Partial_Sig) %>% slice_min(Partial_FDR, n = 30),
+    aes(label = Protein),
+    size = 2.3,
+    max.overlaps = 30
+  ) +
+  scale_color_manual(values = c(
+    "Up → Kill (controlled)"   = "#D13A7A",
+    "Down → Kill (controlled)" = "#047499",
+    "Not significant"          = "gray80"
+  )) +
+  labs(
+    title = "Protein–Toxicity Association (Concentration-Controlled)",
+    subtitle = "Partial Spearman correlation controlling for log10(concentration)",
+    x = "Partial Spearman ρ",
+    y = expression(-log[10] * "(FDR)")
+  ) +
+  theme_bw() + theme(aspect.ratio = 1)
+
+print(p_volcano_partial)
+
+tox_up_proteins   <- partial_results %>% filter(Partial_Sig, Partial_rho >  0.3) %>% pull(Protein)
+tox_down_proteins <- partial_results %>% filter(Partial_Sig, Partial_rho < -0.3) %>% pull(Protein)
+
+cat(sprintf(
+  "\nProteins positively associated with toxicity (|ρ|>0.3): %d\n",
+  length(tox_up_proteins)
+))
+cat(sprintf(
+  "Proteins negatively associated with toxicity (|ρ|>0.3): %d\n",
+  length(tox_down_proteins)
+))
+
+write.xlsx(partial_results, file.path(data_dir, "Plot01_partial_results.xlsx"))
+ggsave(file.path(fig_dir, "Plot01_partial_results.pdf"), p_volcano_partial, width = 7, height = 7)
+```
+
+
+```{r PART 3: Scatter Plot + Four-Quadrant Analysis (Concentration-Controlled Version)}
+cor_result <- cor.test(
+  compound_metrics$Euclidean_Dist, 
+  compound_metrics$Inhibition_Rate, 
+  method = "spearman",
+  use = "complete.obs"
+)
+
+
+plot_data <- compound_metrics %>%
+  filter(!is.na(Inhibition_Rate) & !is.na(Euclidean_Dist))
+
+r_label <- sprintf(
+  "ρ = %.3f\np = %.2e\nn = %d",
+  cor_result$estimate, 
+  cor_result$p.value, 
+  nrow(plot_data)
+)
+
+
+p1_conc <- ggplot(
+  plot_data,
+  aes(x = Euclidean_Dist, y = Inhibition_Rate)
+) +
+  geom_point(
+    aes(
+      color = Inhibition_Rate,
+      size = N_Extreme
+    ), 
+    alpha = 0.7
+  ) +
+  scale_color_gradient(
+    low = "#deebf7",
+    high = "#5F6A8F", 
+    name = "Inhibition\nRate (%)"
+  ) +
+  scale_size_continuous(
+    range = c(1.5, 5), 
+    name = "Extreme\nEvents"
+  ) +
+  geom_smooth(
+    method = "lm", 
+    se = TRUE, 
+    color = "#5F6A8F", 
+    linetype = "dashed",
+    linewidth = 1, 
+    alpha = 0.2
+  ) +
+  annotate(
+    "text", 
+    x = min(plot_data$Euclidean_Dist) + 
+      0.05 * diff(range(plot_data$Euclidean_Dist)),
+    y = max(plot_data$Inhibition_Rate) - 
+      0.05 * diff(range(plot_data$Inhibition_Rate)),
+    label = r_label,
+    hjust = 0, 
+    vjust = 1, 
+    size = 4,
+    color = "black", 
+    fontface = "bold",
+    lineheight = 0.9
+  ) +
+  geom_text_repel(
+    data = plot_data %>% 
+      filter(
+        Inhibition_Rate > quantile(Inhibition_Rate, 0.9, na.rm = TRUE) |
+        Euclidean_Dist > quantile(Euclidean_Dist, 0.9, na.rm = TRUE)
+      ),
+    aes(label = Compound),
+    size = 2.8,
+    max.overlaps = 20,
+    color = "gray20",
+    segment.color = "gray50",
+    segment.size = 0.3
+  ) +
+  labs(
+    title = "Proteome Perturbation vs Cell Growth Inhibition",
+    subtitle = sprintf(
+      "Proteomics distance vs cellular toxicity | Point size = extreme events | n = %d compounds",
+      nrow(plot_data)
+    ),
+    x = "Euclidean Distance from DMSO (Proteome Space)",
+    y = "Cell Growth Inhibition Rate (%)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 9, color = "gray30"),
+    legend.position = "right",
+    legend.box = "vertical",
+    aspect.ratio = 1,
+    panel.grid.minor = element_blank()
+  )
+
+
+ggsave(file.path(fig_dir, "Fig_Proteome_vs_Inhibition.pdf"), p1_conc, width = 7, height = 7)
+
+print(p1_conc)
+
+metrics_valid <- compound_metrics %>% filter(!is.na(Inhibition_Rate))
+dist_q75  <- quantile(metrics_valid$Euclidean_Dist, 0.75)
+dist_q25  <- quantile(metrics_valid$Euclidean_Dist, 0.25)
+inhib_q75 <- quantile(metrics_valid$Inhibition_Rate, 0.75)
+inhib_q25 <- quantile(metrics_valid$Inhibition_Rate, 0.25)
+
+metrics_valid <- metrics_valid %>%
+  mutate(Quadrant_Strict = case_when(
+    Euclidean_Dist >= dist_q75 & Inhibition_Rate >= inhib_q75 ~ "Q1: High Perturbation\nHigh Toxicity",
+    Euclidean_Dist <= dist_q25 & Inhibition_Rate >= inhib_q75 ~ "Q2: Low Perturbation\nHigh Toxicity",
+    Euclidean_Dist <= dist_q25 & Inhibition_Rate <= inhib_q25 ~ "Q3: Low Perturbation\nLow Toxicity",
+    Euclidean_Dist >= dist_q75 & Inhibition_Rate <= inhib_q25 ~ "Q4: High Perturbation\nLow Toxicity",
+    TRUE ~ "Middle\n(Ambiguous)"
+  ))
+
+cat("\nFour-quadrant statistics:\n")
+print(table(metrics_valid$Quadrant_Strict))
+
+p_quad <- ggplot(metrics_valid, aes(x = Euclidean_Dist, y = Inhibition_Rate)) +
+  annotate("rect", xmin = dist_q75, xmax = Inf, ymin = inhib_q75, ymax = Inf, fill = "#fee0d2", alpha = 0.3) +
+  annotate("rect", xmin = -Inf, xmax = dist_q25, ymin = inhib_q75, ymax = Inf, fill = "#fff7bc", alpha = 0.3) +
+  annotate("rect", xmin = -Inf, xmax = dist_q25, ymin = -Inf, ymax = inhib_q25, fill = "#e5f5e0", alpha = 0.3) +
+  annotate("rect", xmin = dist_q75, xmax = Inf, ymin = -Inf, ymax = inhib_q25, fill = "#deebf7", alpha = 0.3) +
+  annotate("rect", xmin = dist_q25, xmax = dist_q75, ymin = inhib_q25, ymax = inhib_q75, fill = "gray95", alpha = 0.5) +
+  geom_vline(xintercept = c(dist_q25, dist_q75), linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = c(inhib_q25, inhib_q75), linetype = "dashed", color = "gray50") +
+  geom_point(aes(color = Quadrant_Strict, shape = factor(Concentration)), size = 2.5, alpha = 0.7) +
+  scale_shape_manual(values = c("0.1" = 17, "1" = 15, "10" = 16), name = "Conc (μM)") +
+  geom_text_repel(
+    data = . %>% filter(Quadrant_Strict %in% c(
+      "Q2: Low Perturbation\nHigh Toxicity",
+      "Q4: High Perturbation\nLow Toxicity"
+    )),
+    aes(label = Compound),
+    size = 2,
+    max.overlaps = 20
+  ) +
+  annotate("text",
+    x = dist_q75 + (max(metrics_valid$Euclidean_Dist) - dist_q75) * 0.5,
+    y = inhib_q75 + (max(metrics_valid$Inhibition_Rate) - inhib_q75) * 0.5,
+    label = "Q1\nBroad Toxic",
+    fontface = "bold",
+    color = "#e41a1c",
+    size = 3.5
+  ) +
+  annotate("text",
+    x = dist_q25 * 0.5,
+    y = inhib_q75 + (max(metrics_valid$Inhibition_Rate) - inhib_q75) * 0.5,
+    label = "Q2\nSilent Killers",
+    fontface = "bold",
+    color = "#d95f02",
+    size = 3.5
+  ) +
+  annotate("text",
+    x = dist_q25 * 0.5,
+    y = inhib_q25 * 0.5,
+    label = "Q3\nInert",
+    fontface = "bold",
+    color = "gray50",
+    size = 3.5
+  ) +
+  annotate("text",
+    x = dist_q75 + (max(metrics_valid$Euclidean_Dist) - dist_q75) * 0.5,
+    y = inhib_q25 * 0.5,
+    label = "Q4\nAdaptive\nReprogramming",
+    fontface = "bold",
+    color = "#377eb8",
+    size = 3.5
+  ) +
+  scale_color_manual(values = c(
+    "Q1: High Perturbation\nHigh Toxicity" = "#e41a1c",
+    "Q2: Low Perturbation\nHigh Toxicity"  = "#ff7f00",
+    "Q3: Low Perturbation\nLow Toxicity"   = "#999999",
+    "Q4: High Perturbation\nLow Toxicity"  = "#377eb8",
+    "Middle\n(Ambiguous)"                  = "gray70"
+  )) +
+  labs(
+    title = "Stringent Quadrant Analysis (25th/75th Percentile)",
+    subtitle = sprintf(
+      "Dist: Q25=%.1f Q75=%.1f | Inhib: Q25=%.1f%% Q75=%.1f%%",
+      dist_q25, dist_q75, inhib_q25, inhib_q75
+    ),
+    x = "Proteome Perturbation (Euclidean Distance from DMSO)",
+    y = "Cell Growth Inhibition (%)"
+  ) +
+  theme_bw() + theme(legend.position = "bottom", aspect.ratio = 0.85)
+
+print(p_quad)
+```
+
+```{r PART 4: Elastic Net + Feature-Number Sensitivity Analysis}
+
+# 4.1 Base elastic net modeling 
+X_prot <- t(l2fc_matrix)
+X_conc <- compound_metrics$Log10_Conc
+X_full <- cbind(X_prot, Log10_Conc = X_conc)
+y <- compound_metrics$Inhibition_Rate
+
+valid_idx <- complete.cases(X_full) & !is.na(y)
+X_clean <- X_full[valid_idx, ]
+y_clean <- y[valid_idx]
+
+cat(sprintf("Modeling sample size: %d (excluding %d missing values)\n", sum(valid_idx), sum(!valid_idx)))
+
+n_features <- ncol(X_clean)
+penalty_vec <- rep(1, n_features)
+penalty_vec[n_features] <- 0 
+
+set.seed(42)
+cv_fit <- cv.glmnet(
+  X_clean, y_clean,
+  alpha = 0.5, nfolds = 10,
+  penalty.factor = penalty_vec
+)
+
+best_coef <- coef(cv_fit, s = "lambda.min")
+
+protein_coefs <- data.frame(
+  Protein = rownames(best_coef)[-1][best_coef[-1, 1] != 0 & rownames(best_coef)[-1] != "Log10_Conc"],
+  Coefficient = best_coef[-1, 1][best_coef[-1, 1] != 0 & rownames(best_coef)[-1] != "Log10_Conc"],
+  stringsAsFactors = FALSE
+) %>%
+  mutate(Abs_Coef = abs(Coefficient)) %>%
+  arrange(desc(Abs_Coef))
+
+intercept_value <- best_coef["(Intercept)", 1]
+conc_coef <- best_coef["Log10_Conc", 1]
+
+cat(sprintf("\nElastic net selected total proteins: %d\n", nrow(protein_coefs)))
+cat(sprintf("Intercept: %.4f, Log10_Conc coefficient: %.4f\n", intercept_value, conc_coef))
+
+
+# 4.2 Stability selection (consistent with original logic; loosen threshold to 0.5 to avoid too-small candidate pools)
+set.seed(123)
+n_boot <- 100
+
+prot_only_names <- colnames(X_clean)[colnames(X_clean) != "Log10_Conc"]
+
+selection_matrix <- matrix(
+  0,
+  nrow = length(prot_only_names),
+  ncol = n_boot,
+  dimnames = list(prot_only_names, NULL)
+)
+
+for (i in 1:n_boot) {
+  idx <- sample(
+    1:nrow(X_clean),
+    size = floor(0.8 * nrow(X_clean)),
+    replace = FALSE
+  )
+
+  cv_fit_b <- cv.glmnet(
+    X_clean[idx, ], y_clean[idx],
+    alpha = 0.5,
+    penalty.factor = penalty_vec,
+    nfolds = 5
+  )
+
+  coef_i <- coef(cv_fit_b, s = "lambda.min")
+  selected <- setdiff(
+    rownames(coef_i)[coef_i[, 1] != 0],
+    c("(Intercept)", "Log10_Conc")
+  )
+  selection_matrix[selected, i] <- 1
+}
+
+stability_df <- data.frame(
+  Protein = rownames(selection_matrix),
+  Selection_Frequency = rowMeans(selection_matrix)
+) %>% arrange(desc(Selection_Frequency))
+
+
+stable_proteins <- stability_df %>%
+  filter(Selection_Frequency >= 0.6) %>%
+  pull(Protein)
+
+cat(sprintf("Number of stability-selected proteins (≥0.5): %d\n", length(stable_proteins)))
+
+
+# 4.3 Random forest importance (consistent with original logic)
+rf_proteins <- partial_results %>% filter(Partial_Sig) %>% pull(Protein)
+rf_cols <- c(intersect(rf_proteins, colnames(X_clean)), "Log10_Conc")
+X_rf <- X_clean[, rf_cols]
+
+set.seed(42)
+rf_fit <- randomForest(
+  x = X_rf,
+  y = y_clean,
+  ntree = 500,
+  mtry = max(floor(ncol(X_rf) / 3), 2),
+  importance = TRUE
+)
+
+importance_df <- data.frame(
+  Feature = rownames(rf_fit$importance),
+  IncMSE = rf_fit$importance[, "%IncMSE"]
+) %>% arrange(desc(IncMSE))
+
+
+rf_high <- importance_df %>%
+  filter(Feature != "Log10_Conc") %>%
+  slice_max(IncMSE, prop = 0.8) %>%
+  pull(Feature)
+
+cat(sprintf("Number of high-importance proteins from random forest: %d\n", length(rf_high)))
+
+
+# 4.4 Build candidate core protein pool (auto-adapt to avoid too-small pools)
+core_intersect <- Reduce(intersect, list(protein_coefs$Protein, stable_proteins, rf_high))
+cat(sprintf("Triple-intersection proteins count: %d\n", length(core_intersect)))
+
+if (length(core_intersect) < 5) {
+  cat("⚠️ Triple intersection < 5; relaxing candidate selection: at least 2 screening conditions\n")
+  protein_condition <- data.frame(
+    Protein = prot_only_names,
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      In_Elastic = Protein %in% protein_coefs$Protein,
+      In_Stable  = Protein %in% stable_proteins,
+      In_RF       = Protein %in% rf_high,
+      Condition_Count = In_Elastic + In_Stable + In_RF
+    )
+
+  candidate_pool <- protein_condition %>%
+    filter(Condition_Count >= 2) %>%
+    pull(Protein)
+} else {
+  candidate_pool <- core_intersect
+}
+
+candidate_pool <- protein_coefs %>%
+  filter(Protein %in% candidate_pool) %>%
+  pull(Protein)
+
+cat(sprintf("Final candidate core protein pool size: %d\n", length(candidate_pool)))
+
+if (length(candidate_pool) < 3) stop("Candidate core protein pool < 3; cannot perform sensitivity analysis. Please check screening criteria")
+
+
+# 4.5 Feature-number sensitivity analysis (nested CV evaluating different N)
+set.seed(42)
+N_OUTER <- 5  
+N_INNER <- 5
+
+N_max <- length(candidate_pool)  
+N_min <- max(3, min(5, N_max))   
+N_range <- N_min:N_max
+
+
+nested_r2_by_N <- data.frame(
+  N = N_range,
+  Mean_R2 = NA_real_,
+  SD_R2 = NA_real_,
+  stringsAsFactors = FALSE
+)
+
+pb <- txtProgressBar(min = 0, max = length(N_range), style = 3)
+
+for (n_idx in seq_along(N_range)) {
+  N_curr <- N_range[n_idx]
+  curr_proteins <- head(candidate_pool, N_curr)
+  X_curr <- X_clean[, c(curr_proteins, "Log10_Conc")]
+  penalty_curr <- c(rep(1, N_curr), 0)
+  outer_folds <- sample(rep(1:N_OUTER, length.out = nrow(X_curr)))
+  r2_list <- numeric(N_OUTER)
+
+  for (k in 1:N_OUTER) {
+    tr <- which(outer_folds != k)
+    te <- which(outer_folds == k)
+    cv_k <- cv.glmnet(
+      X_curr[tr, ], y_clean[tr],
+      alpha = 0.5, nfolds = N_INNER,
+      penalty.factor = penalty_curr
+    )
+
+    pred_k <- predict(cv_k, X_curr[te, ], s = "lambda.min")[, 1]
+    r2_list[k] <- 1 - sum((pred_k - y_clean[te])^2) /
+      sum((y_clean[te] - mean(y_clean[tr]))^2)
+  }
+
+  nested_r2_by_N$Mean_R2[n_idx] <- mean(r2_list)
+  nested_r2_by_N$SD_R2[n_idx] <- sd(r2_list)
+  setTxtProgressBar(pb, n_idx)
+}
+close(pb)
+
+print(nested_r2_by_N)
+
+
+# 4.6 Elbow method to determine optimal core protein number
+nested_r2_by_N$R2_diff <- c(NA, diff(nested_r2_by_N$Mean_R2))
+
+
+elbow_idx <- which(nested_r2_by_N$R2_diff < 0.01 | nested_r2_by_N$R2_diff < -0.005)[1]
+if (is.na(elbow_idx)) elbow_idx <- nrow(nested_r2_by_N) 
+optimal_N <- nested_r2_by_N$N[elbow_idx]
+
+cat(sprintf("\n★ Optimal core protein number (Elbow-selected): %d\n", optimal_N))
+cat(sprintf(
+  "  Corresponding nested CV R²: %.3f ± %.3f\n",
+  nested_r2_by_N$Mean_R2[elbow_idx], nested_r2_by_N$SD_R2[elbow_idx]
+))
+
+p_elbow <- ggplot(nested_r2_by_N, aes(x = N, y = Mean_R2)) +
+  geom_line(color = "#377eb8", linewidth = 1.2) +
+  geom_point(color = "#e41a1c", size = 3) +
+  geom_errorbar(
+    aes(ymin = Mean_R2 - SD_R2, ymax = Mean_R2 + SD_R2),
+    width = 0.2, alpha = 0.5
+  ) +
+  geom_vline(xintercept = optimal_N, linetype = "dashed", color = "#d73027", linewidth = 1) +
+  annotate(
+    "text",
+    x = optimal_N + 0.2,
+    y = min(nested_r2_by_N$Mean_R2),
+    label = sprintf("Optimal N = %d", optimal_N),
+    color = "#d73027",
+    hjust = 0,
+    size = 4
+  ) +
+  labs(
+    title = "Feature-Number Sensitivity Analysis",
+    subtitle = "Nested CV R² vs number of core proteins (Elbow selects optimal N)",
+    x = "Number of core proteins",
+    y = "Nested CV R² (mean ± SD)"
+  ) +
+  theme_bw(base_size = 12)
+
+print(p_elbow)
+
+
+# 4.7 Determine final core proteins
+core_proteins <- head(candidate_pool, optimal_N)
+N_CORE_ACTUAL <- length(core_proteins)
+
+cat(sprintf("\nFinal selected core protein count (CPS-%d): %d\n", N_CORE_ACTUAL, N_CORE_ACTUAL))
+print(core_proteins)
+```
+
+
+```{r PART 5: Bootstrap Confidence Annotations}
+
+set.seed(42)
+outer_folds <- sample(rep(1:N_OUTER, length.out = nrow(X_clean)))
+
+nested_results <- data.frame(Fold = 1:N_OUTER, R2 = NA_real_)
+
+for (k in 1:N_OUTER) {
+  tr <- which(outer_folds != k)
+  te <- which(outer_folds == k)
+
+  cv_k <- cv.glmnet(X_clean[tr, ], y_clean[tr], alpha = 0.5,
+                    nfolds = N_INNER, penalty.factor = penalty_vec)
+
+  pred_k <- predict(cv_k, X_clean[te, ], s = "lambda.min")[, 1]
+
+  nested_results$R2[k] <- 1 - sum((pred_k - y_clean[te])^2) /
+    sum((y_clean[te] - mean(y_clean[tr]))^2)
+}
+
+cat(sprintf(
+  "Full-feature nested CV R²: %.3f ± %.3f\n",
+  mean(nested_results$R2), sd(nested_results$R2)
+))
+
+
+set.seed(42)
+n_boot <- 200
+
+all_feature_names <- colnames(X_clean)
+boot_freq <- setNames(rep(0, length(all_feature_names)), all_feature_names)
+
+boot_coef_sign <- matrix(
+  0,
+  nrow = n_boot,
+  ncol = length(all_feature_names),
+  dimnames = list(NULL, all_feature_names)
+)
+
+boot_oob_r2 <- numeric(n_boot)
+
+cat("Running 200x Bootstrap elastic net...\n")
+pb <- txtProgressBar(min = 0, max = n_boot, style = 3)
+
+for (b in 1:n_boot) {
+  boot_idx <- sample(1:nrow(X_clean), replace = TRUE)
+  oob_idx  <- setdiff(1:nrow(X_clean), unique(boot_idx))
+
+  cv_b <- cv.glmnet(
+    X_clean[boot_idx, ], y_clean[boot_idx],
+    alpha = 0.5,
+    nfolds = 5,
+    penalty.factor = penalty_vec
+  )
+
+  coef_b <- coef(cv_b, s = "lambda.min")
+
+  sel_b <- rownames(coef_b)[coef_b[, 1] != 0 & rownames(coef_b) != "(Intercept)"]
+
+  boot_freq[sel_b] <- boot_freq[sel_b] + 1
+
+  for (feat in sel_b) if (feat %in% all_feature_names) {
+    boot_coef_sign[b, feat] <- sign(coef_b[feat, 1])
+  }
+
+  if (length(oob_idx) >= 10) {
+    pred_oob <- predict(cv_b, X_clean[oob_idx, ], s = "lambda.min")[, 1]
+    boot_oob_r2[b] <- 1 - sum((pred_oob - y_clean[oob_idx])^2) /
+      sum((y_clean[oob_idx] - mean(y_clean[boot_idx]))^2)
+  }
+
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+boot_freq_pct <- boot_freq / n_boot * 100
+
+
+core_annotated <- data.frame(Protein = core_proteins, stringsAsFactors = FALSE) %>%
+  left_join(protein_coefs, by = "Protein") %>%
+  mutate(Boot_Select_Pct = boot_freq_pct[Protein])
+
+core_annotated <- core_annotated %>%
+  mutate(Boot_Sign_Consistency = sapply(seq_len(n()), function(i) {
+    p <- Protein[i]
+    signs <- boot_coef_sign[, p]
+    signs <- signs[signs != 0]
+    if (length(signs) == 0) return(NA)
+    mean(signs == sign(Coefficient[i])) * 100
+  }))
+
+core_annotated <- core_annotated %>%
+  mutate(Confidence = case_when(
+    Boot_Select_Pct >= 70 & Boot_Sign_Consistency >= 80 ~ "High",
+    Boot_Select_Pct >= 40 & Boot_Sign_Consistency >= 70 ~ "Moderate",
+    Boot_Select_Pct >= 20                                ~ "Low (has alternatives)",
+    TRUE                                                 ~ "Context-dependent"
+  )) %>%
+  left_join(partial_results %>% dplyr::select(Protein, Partial_rho, Partial_FDR), by = "Protein") %>%
+  left_join(importance_df %>% dplyr::select(Feature, IncMSE), by = c("Protein" = "Feature")) %>%
+  arrange(desc(abs(Coefficient)))
+
+boot_oob_r2_valid <- boot_oob_r2[boot_oob_r2 != 0]
+
+p_confidence <- ggplot(core_annotated, aes(x = reorder(Protein, abs(Coefficient)))) +
+  geom_col(aes(y = Coefficient, fill = Confidence), alpha = 0.8, width = 0.6) +
+  geom_point(
+    aes(y = Boot_Select_Pct / 100 * max(abs(Coefficient))),
+    color = "black", size = 3
+  ) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "High" = "#d73027", "Moderate" = "#fc8d59",
+    "Low (has alternatives)" = "#fee090", "Context-dependent" = "gray80"
+  )) +
+  scale_y_continuous(
+    name = "Elastic Net Coefficient (bars)",
+    sec.axis = sec_axis(
+      ~ . / max(abs(core_annotated$Coefficient)) * 100,
+      name = "Bootstrap Selection % (dots)"
+    )
+  ) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  labs(
+    title = sprintf("Core Signature: %d Proteins with Bootstrap Confidence", N_CORE_ACTUAL),
+    subtitle = "All retained; bootstrap annotates stability, not filters",
+    x = ""
+  ) +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 9, face = "bold"), legend.position = "bottom")
+
+print(p_confidence)
+
+p_collective <- ggplot(data.frame(R2 = boot_oob_r2_valid), aes(x = R2)) +
+  geom_histogram(bins = 30, fill = "#4575b4", alpha = 0.7, color = "white") +
+  geom_vline(xintercept = mean(boot_oob_r2_valid), color = "red", linewidth = 1) +
+  geom_vline(xintercept = mean(nested_results$R2), color = "darkgreen", linewidth = 1, linetype = "dashed") +
+  labs(
+    title = "Collective Prediction is Stable Despite Feature Variation",
+    x = "Out-of-Bag R²",
+    y = "Count"
+  ) +
+  theme_bw()
+
+print(p_collective)
+```
+
+
+```{r PART 6: Final Model}
+
+final_core <- core_proteins
+X_final <- X_clean[, c(final_core, "Log10_Conc")]
+penalty_final <- c(rep(1, length(final_core)), 0)
+
+set.seed(42)
+cv_final <- cv.glmnet(X_final, y_clean, alpha = 0.5, nfolds = 10, penalty.factor = penalty_final)
+pred_final <- predict(cv_final, X_final, s = "lambda.min")[, 1]
+r2_final <- cor(pred_final, y_clean)^2
+
+final_nested_r2 <- numeric(N_OUTER)
+
+for (k in 1:N_OUTER) {
+  te <- which(outer_folds == k)
+  tr <- which(outer_folds != k)
+
+  cv_k <- cv.glmnet(
+    X_final[tr, ], y_clean[tr],
+    alpha = 0.5,
+    nfolds = N_INNER,
+    penalty.factor = penalty_final
+  )
+
+  pred_k <- predict(cv_k, X_final[te, ], s = "lambda.min")[, 1]
+
+  final_nested_r2[k] <- 1 - sum((pred_k - y_clean[te])^2) /
+    sum((y_clean[te] - mean(y_clean[tr]))^2)
+}
+
+cat(sprintf("  Training R²:    %.3f\n", r2_final))
+cat(sprintf("  Nested CV R²:  %.3f ± %.3f\n", mean(final_nested_r2), sd(final_nested_r2)))
+
+rf_final <- randomForest(x = X_final, y = y_clean, ntree = 500, importance = TRUE)
+r2_rf_final <- 1 - sum((rf_final$predicted - y_clean)^2) /
+  sum((y_clean - mean(y_clean))^2)
+
+cat(sprintf("  Random forest OOB R²: %.3f\n", r2_rf_final))
+```
+
+```{r PART 7 Annotation}
+
+core_annotation <- data.frame(
+  UniProt = c("O60907",  "Q9NVJ2", "P54920", "Q9GZT6","P33121", "Q6IQ23"),
+  Gene    = c("TBL1X",   "ARL8B",  "NAPA",  "CCDC90B", "ACSL1",  "PLEKHA7"),
+  Full_Name = c(
+    "F-box-like/WD repeat-containing protein",          
+    "ADP-ribosylation factor-like protein 8B",           
+    "Alpha-soluble NSF attachment protein", 
+    "Coiled-coil domain-containing protein 90B",    
+    "Long-chain-fatty-acid--CoA ligase 1",
+    "Pleckstrin homology domain-containing family A member 7"  
+  ),
+  Function = c(
+    "Transcription regulation",  
+    "Protein transport / Cell cycle / Cell division",
+    "Protein transport",
+    "Mitochondrion", 
+    "Fatty acid metabolism/Lipid metabolism",
+    "Cell adhesion / Cell junction"     
+  ),
+  stringsAsFactors = FALSE
+)
+
+core6 <- core_annotation %>%
+  left_join(core_annotated, by = c("UniProt" = "Protein")) %>%
+  mutate(
+    Direction = ifelse(Coefficient > 0, "Up → Toxicity", "Down → Toxicity"),
+    Abs_Coef  = abs(Coefficient),
+    Rank      = row_number()
+  ) %>%
+  arrange(desc(Abs_Coef)) %>%
+  dplyr::rename(Boot_Pct = Boot_Select_Pct)
+
+View(core6)
+```
+
+```{r PART 8: Export CPS Model Coefficients}
+
+final_coef <- coef(cv_final, s = "lambda.min")
+intercept_value <- final_coef["(Intercept)", 1]
+conc_coef_value <- final_coef["Log10_Conc", 1]
+
+cps6_coefs <- data.frame(
+  UniProt     = final_core,
+  Coefficient = sapply(final_core, function(p) final_coef[p, 1]),
+  stringsAsFactors = FALSE
+) %>%
+  left_join(core6 %>% dplyr::select(UniProt, Gene, Full_Name, Function,
+                                    Partial_rho, Boot_Pct, Confidence), by = "UniProt") %>%
+  mutate(Direction = ifelse(Coefficient > 0, "positive (Up -> Toxicity)", "negative (Down -> Toxicity)"),
+         Abs_Coef  = abs(Coefficient)) %>%
+  arrange(desc(Abs_Coef))
+
+print(cps6_coefs %>% dplyr::select(Gene, UniProt, Coefficient, Direction, Boot_Pct, Confidence))
+
+
+write.xlsx(cps6_coefs, file.path(data_dir, "Plot02_CPS6_elasticnet_coefficients.xlsx"))
+write.csv(data.frame(Parameter = c("Intercept", "Log10_Conc_Coefficient"),Value = c(intercept_value, conc_coef_value)),file.path(data_dir,"Plot02_CPS6_model_parameters.csv"), row.names = FALSE)
+
+
+# Validate by manual recomputation
+manual_pred <- intercept_value
+for (i in seq_len(nrow(cps6_coefs))) {
+  manual_pred <- manual_pred + cps6_coefs$Coefficient[i] * X_final[, cps6_coefs$UniProt[i]]
+}
+manual_pred <- manual_pred + conc_coef_value * X_final[, "Log10_Conc"]
+
+model_pred <- predict(cv_final, X_final, s = "lambda.min")[, 1]
+max_diff <- max(abs(manual_pred - model_pred))
+
+cat(sprintf(
+  "\nManual vs model maximum difference: %.2e %s\n",
+  max_diff,
+  ifelse(max_diff < 1e-6, "✓ consistent", "⚠️ please check")
+))
+```
+
+```{r PART 9: Plot}
+core6_proteins <- core6$UniProt
+plot_protein_scatter_partial <- function(protein_id, protein_name, gene_name) {prot_l2fc <- l2fc_matrix[protein_id, ]
+  plot_data <- data.frame(
+    Compound = names(prot_l2fc),
+    Log2FC = as.numeric(prot_l2fc),
+    Inhibition_Rate = compound_metrics$Inhibition_Rate,
+    Log10_Conc = compound_metrics$Log10_Conc,
+    stringsAsFactors = FALSE
+  ) %>%
+    filter(!is.na(Log2FC) & !is.na(Inhibition_Rate) & !is.na(Log10_Conc))
+  rx <- rank(plot_data$Log2FC)
+  ry <- rank(plot_data$Inhibition_Rate)
+  rz <- rank(plot_data$Log10_Conc)
+
+  res_x <- residuals(lm(rx ~ rz))
+  res_y <- residuals(lm(ry ~ rz))
+
+  cor_partial <- cor.test(res_x, res_y, method = "spearman")
+  prot_info <- core6 %>% filter(UniProt == protein_id)
+  partial_info <- partial_results %>% filter(Protein == protein_id)
+
+  if (nrow(partial_info) > 0) {
+    partial_rho <- partial_info$Partial_rho
+    partial_p <- partial_info$Partial_p
+  } else {
+    partial_rho <- cor_partial$estimate
+    partial_p <- cor_partial$p.value
+  }
+  annotation_text <- sprintf(
+    "Partial ρ = %.3f\np = %.2e\n(conc-controlled)\nn = %d",
+    partial_rho,
+    partial_p,
+    nrow(plot_data)
+  )
+
+p <- ggplot(plot_data, aes(x = Log2FC, y = Inhibition_Rate)) +
+    geom_point(aes(color = Log2FC), size = 1.5, alpha = 0.5) +
+    scale_color_gradient(
+      low = "#deebf7",
+      high = "#5F6A8F",
+      name = expression(log[2] * "FC")
+    ) +
+    geom_smooth(
+      method = "lm", se = TRUE,
+      color = "#5F6A8F", linetype = "dashed",
+      linewidth = 1, alpha = 0.2
+    ) +
+    annotate(
+      "text",
+      x = min(plot_data$Log2FC) + 0.05 * diff(range(plot_data$Log2FC)),
+      y = max(plot_data$Inhibition_Rate) - 0.05 * diff(range(plot_data$Inhibition_Rate)),
+      label = annotation_text,
+      hjust = 0, vjust = 1, size = 4,
+      color = "black", fontface = "bold",
+      lineheight = 0.9
+    ) +
+    labs(
+      title = sprintf("%s (%s)", gene_name, protein_id),
+      subtitle = sprintf(
+        "%s | Elastic Net Coef: %.4f | %s",
+        prot_info$Function,
+        prot_info$Coefficient,
+        prot_info$Direction
+      ),
+      x = expression(log[2] * "FC"),
+      y = "Inhibition (%)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 9, color = "gray30"),
+      legend.position = "right",
+      legend.key.height = unit(1, "cm"),
+      aspect.ratio = 1,
+      panel.grid.minor = element_blank()
+    )
+
+  return(p)
+}
+
+# Generate plots for each core protein
+plot_list <- list()
+for (i in 1:nrow(core6)) {
+  protein_id <- core6$UniProt[i]
+  gene_name <- core6$Gene[i]
+  full_name <- core6$Full_Name[i]
+
+  cat(sprintf("Plotting %d/6: %s (%s)\n", i, gene_name, protein_id))
+
+  plot_list[[i]] <- plot_protein_scatter_partial(protein_id, full_name, gene_name)
+}
+
+# Combine
+p_combined <- wrap_plots(plot_list, ncol = 3, nrow = 2)
+print(p_combined)
+
+ggsave(file.path(fig_dir,"Plot02_Core6_Proteins_Log2FC_vs_Inhibition_Partial.pdf"),p_combined,width = 21, height = 7)
+
+core6_stats <- data.frame(
+  Gene = character(),
+  UniProt = character(),
+  Partial_rho = numeric(),
+  Partial_p = numeric(),
+  Elastic_Coef = numeric(),
+  Direction = character(),
+  stringsAsFactors = FALSE
+)
+
+for (i in 1:nrow(core6)) {
+  protein_id <- core6$UniProt[i]
+  gene_name <- core6$Gene[i]
+
+  partial_info <- partial_results %>% filter(Protein == protein_id)
+  prot_info <- core6 %>% filter(UniProt == protein_id)
+
+  core6_stats <- rbind(core6_stats, data.frame(
+    Gene = gene_name,
+    UniProt = protein_id,
+    Partial_rho = partial_info$Partial_rho,
+    Partial_p = partial_info$Partial_p,
+    Elastic_Coef = prot_info$Coefficient,
+    Direction = prot_info$Direction,
+    stringsAsFactors = FALSE
+  ))
+}
+
+
+
+write.xlsx(core6_stats, file.path(data_dir, "Core6_Partial_Correlation_Stats.xlsx"))
+```
+
+```{r}
+color_schemes <- list(
+  list(low = "#deebf7", high = "#6CB0C4"),  #
+  list(low = "#fee5d9", high = "#D32F2F"),  
+  list(low = "#efedf5", high = "#F5A623"),  
+  list(low = "#e5f5e0", high = "#31a354"), 
+  list(low = "#deebf7", high = "#E89ABE"), 
+  list(low = "#f2f0f7", high = "#E6847C")   
+)
+
+plot_protein_scatter_partial <- function(protein_id, protein_name, gene_name, color_scheme) {
+  prot_l2fc <- l2fc_matrix[protein_id, ]
+  plot_data <- data.frame(
+    Compound = names(prot_l2fc),
+    Log2FC = as.numeric(prot_l2fc),
+    Inhibition_Rate = compound_metrics$Inhibition_Rate,
+    Log10_Conc = compound_metrics$Log10_Conc,
+    stringsAsFactors = FALSE
+  ) %>%
+    filter(!is.na(Log2FC) & !is.na(Inhibition_Rate) & !is.na(Log10_Conc))
+  
+  rx <- rank(plot_data$Log2FC)
+  ry <- rank(plot_data$Inhibition_Rate)
+  rz <- rank(plot_data$Log10_Conc)
+
+  res_x <- residuals(lm(rx ~ rz))
+  res_y <- residuals(lm(ry ~ rz))
+
+  cor_partial <- cor.test(res_x, res_y, method = "spearman")
+  prot_info <- core6 %>% filter(UniProt == protein_id)
+  partial_info <- partial_results %>% filter(Protein == protein_id)
+
+  if (nrow(partial_info) > 0) {
+    partial_rho <- partial_info$Partial_rho
+    partial_p <- partial_info$Partial_p
+  } else {
+    partial_rho <- cor_partial$estimate
+    partial_p <- cor_partial$p.value
+  }
+  
+  annotation_text <- sprintf(
+    "Partial ρ = %.3f\np = %.2e\n(conc-controlled)\nn = %d",
+    partial_rho,
+    partial_p,
+    nrow(plot_data)
+  )
+
+  p <- ggplot(plot_data, aes(x = Log2FC, y = Inhibition_Rate)) +
+    geom_point(aes(color = Log2FC), size = 1.5, alpha = 0.5) +
+    scale_color_gradient(
+      low = color_scheme$low,
+      high = color_scheme$high,
+      name = expression(log[2] * "FC")
+    ) +
+    geom_smooth(
+      method = "lm", se = TRUE,
+      color = color_scheme$high,
+      linetype = "dashed",
+      linewidth = 1, alpha = 0.2
+    ) +
+    annotate(
+      "text",
+      x = min(plot_data$Log2FC) + 0.05 * diff(range(plot_data$Log2FC)),
+      y = max(plot_data$Inhibition_Rate) - 0.05 * diff(range(plot_data$Inhibition_Rate)),
+      label = annotation_text,
+      hjust = 0, vjust = 1, size = 4,
+      color = "black", fontface = "bold",
+      lineheight = 0.9
+    ) +
+    labs(
+      title = sprintf("%s (%s)", gene_name, protein_id),
+      subtitle = sprintf(
+        "%s | Elastic Net Coef: %.4f | %s",
+        prot_info$Function,
+        prot_info$Coefficient,
+        prot_info$Direction
+      ),
+      x = expression(log[2] * "FC"),
+      y = "Inhibition (%)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 9, color = "gray30"),
+      legend.position = "right",
+      legend.key.height = unit(1, "cm"),
+      aspect.ratio = 1,
+      panel.grid.minor = element_blank()
+    )
+
+  return(p)
+}
+
+# Generate plots for each core protein
+plot_list <- list()
+for (i in 1:nrow(core6)) {
+  protein_id <- core6$UniProt[i]
+  gene_name <- core6$Gene[i]
+  full_name <- core6$Full_Name[i]
+
+  cat(sprintf("Plotting %d/6: %s (%s)\n", i, gene_name, protein_id))
+
+  plot_list[[i]] <- plot_protein_scatter_partial(
+    protein_id, 
+    full_name, 
+    gene_name,
+    color_schemes[[i]] 
+  )
+}
+
+# Combine
+p_combined <- wrap_plots(plot_list, ncol = 3, nrow = 2)
+print(p_combined)
+```
+
+
+```{r PART 10:  CPS-6 Validation}
+sensitivity_df <- read.csv(file.path(input_dir, "Table S2-DRP_inhibition.csv"))
+cat("Sensitivity table column names:\n")
+print(colnames(sensitivity_df))
+COMPOUND_COL <- "Compound_Name"
+
+cps6_coefs_loaded <- read.xlsx(file.path(data_dir, "Plot02_CPS6_elasticnet_coefficients.xlsx"))
+cps6_w   <- setNames(cps6_coefs_loaded$Coefficient, cps6_coefs_loaded$Gene)
+cps6_map <- setNames(cps6_coefs_loaded$UniProt,     cps6_coefs_loaded$Gene)
+
+cat("\nLoaded CPS weights:\n")
+print(cps6_w)
+
+
+for (g in names(cps6_map)) {
+  cat(sprintf(
+    "  %s (%s): %s\n",
+    g, cps6_map[g],
+    ifelse(cps6_map[g] %in% rownames(l2fc_matrix), "✓ found in matrix", "✗ not found")
+  ))
+}
+
+
+score <- rep(0, ncol(l2fc_matrix))
+names(score) <- colnames(l2fc_matrix)
+
+for (g in names(cps6_w)) {
+  uid <- cps6_map[g]
+  if (uid %in% rownames(l2fc_matrix)) score <- score + cps6_w[g] * l2fc_matrix[uid, ]
+}
+
+cps6 <- data.frame(Compound = colnames(l2fc_matrix), cps6 = score, stringsAsFactors = FALSE) %>%
+  left_join(
+    compound_metrics %>% dplyr::select(Compound, Inhibition_Rate, Concentration, Log10_Conc, Euclidean_Dist),
+    by = "Compound"
+  ) %>%
+  left_join(
+    sensitivity_df %>% dplyr::select(all_of(c("Compound_ID", COMPOUND_COL, "Classification", "Confidence"))),
+    by = setNames(COMPOUND_COL, "Compound")
+  )
+
+cat(sprintf(
+  "\nWith inhibition rate: %d | With classification: %d\n",
+  sum(!is.na(cps6$Inhibition_Rate)),
+  sum(!is.na(cps6$Classification))
+))
+
+write.xlsx(cps6, file.path(data_dir, "Plot03_CPS6_inhibition_all.xlsx"))
+
+
+sv <- cps6 %>% filter(!is.na(Inhibition_Rate))
+rho_all <- cor.test(sv$cps6, sv$Inhibition_Rate, method = "spearman", exact = FALSE)
+
+cat(sprintf(
+  "\nOverall Spearman ρ = %+.3f, p = %.2e\n",
+  rho_all$estimate, rho_all$p.value
+))
+
+
+cps6_cls <- cps6 %>%
+  filter(Classification %in% c("Effective", "Marginal", "Inactive")) %>%
+  mutate(Classification = factor(Classification, levels = c("Effective", "Marginal", "Inactive")))
+
+kw <- kruskal.test(cps6 ~ Classification, data = cps6_cls)
+cat(sprintf("Kruskal-Wallis p = %.2e\n", kw$p.value))
+
+pw <- pairwise.wilcox.test(
+  cps6_cls$cps6, cps6_cls$Classification,
+  p.adjust.method = "BH"
+)
+
+clr <- c(Effective = "#d73027", Marginal = "#fc8d59", Inactive = "#4575b4", `No Label` = "gray75")
+shp_conc <- c("0.1" = 17, "1" = 15, "10" = 16)
+
+
+ei <- cps6_cls %>% filter(Classification %in% c("Effective", "Inactive")) %>%
+  mutate(Label = ifelse(Classification == "Effective", 1, 0))
+roc1   <- roc(ei$Label, ei$cps6, quiet = TRUE); ci1 <- ci.auc(roc1)
+roc_eu <- roc(ei$Label, ei$Euclidean_Dist, quiet = TRUE); ci_eu <- ci.auc(roc_eu)
+dl     <- roc.test(roc1, roc_eu, method = "delong")
+cat(sprintf("CPS-6 AUC = %.3f | Euclidean AUC = %.3f | DeLong p = %.2e\n",
+            auc(roc1), auc(roc_eu), dl$p.value))
+
+blind <- cps6 %>%
+  filter(is.na(Inhibition_Rate) & Classification %in% c("Effective", "Marginal", "Inactive")) %>%
+  mutate(Classification = factor(Classification, levels = c("Effective", "Marginal", "Inactive")))
+
+if (nrow(blind) >= 15) {
+  kw_b <- kruskal.test(cps6 ~ Classification, data = blind)
+  cat(sprintf("Blind test KW p = %.2e (n=%d)\n", kw_b$p.value, nrow(blind)))
+}
+```
+
+```{r PART 11: ROC curves }
+
+blind_ei <- blind %>%
+  filter(Classification %in% c("Effective", "Inactive")) %>%
+  mutate(Label = ifelse(Classification == "Effective", 1, 0))
+
+roc_blind <- roc(blind_ei$Label, blind_ei$cps6, quiet = TRUE)
+ci_blind <- ci.auc(roc_blind)
+
+ci_full  <- ci.auc(roc1)
+ci_eu    <- ci.auc(roc_eu)
+ci_blind <- ci.auc(roc_blind)
+
+lab_full  <- sprintf("CPS-6 Full\nAUC = %.3f (%.3f–%.3f)", 
+                     auc(roc1), ci_full[1], ci_full[3]) 
+
+lab_eu    <- sprintf("Euclidean\nAUC = %.3f (%.3f–%.3f)", 
+                     auc(roc_eu), ci_eu[1], ci_eu[3]) 
+
+lab_blind <- sprintf("CPS-6 Blind\nAUC = %.3f (%.3f–%.3f)", 
+                     auc(roc_blind), ci_blind[1], ci_blind[3])
+
+
+coords_full <- coords(roc1, "best", best.method = "youden", ret = c("threshold", "sensitivity", "specificity"))
+coords_eu <- coords(roc_eu, "best", best.method = "youden", ret = c("threshold", "sensitivity", "specificity"))
+coords_blind <- coords(roc_blind, "best", best.method = "youden", ret = c("threshold", "sensitivity", "specificity"))
+cat("CPS-6 Full (labeled data):\n")
+cat(sprintf("  AUC: %.3f (95%% CI: %.3f-%.3f)\n", auc(roc1), ci_full[1], ci_full[3]))
+cat(sprintf("  Best Threshold: %.3f\n", coords_full$threshold))
+cat(sprintf("  Sensitivity: %.3f (%.1f%%)\n", coords_full$sensitivity, coords_full$sensitivity * 100))
+cat(sprintf("  Specificity: %.3f (%.1f%%)\n", coords_full$specificity, coords_full$specificity * 100))
+cat(sprintf("  Youden's J: %.3f\n\n", coords_full$sensitivity + coords_full$specificity - 1))
+
+cat("Euclidean Distance:\n")
+cat(sprintf("  AUC: %.3f (95%% CI: %.3f-%.3f)\n", auc(roc_eu), ci_eu[1], ci_eu[3]))
+cat(sprintf("  Best Threshold: %.3f\n", coords_eu$threshold))
+cat(sprintf("  Sensitivity: %.3f (%.1f%%)\n", coords_eu$sensitivity, coords_eu$sensitivity * 100))
+cat(sprintf("  Specificity: %.3f (%.1f%%)\n", coords_eu$specificity, coords_eu$specificity * 100))
+cat(sprintf("  Youden's J: %.3f\n\n", coords_eu$sensitivity + coords_eu$specificity - 1))
+
+cat("CPS-6 Blind (no CCK-8):\n")
+cat(sprintf("  AUC: %.3f (95%% CI: %.3f-%.3f)\n", auc(roc_blind), ci_blind[1], ci_blind[3]))
+cat(sprintf("  Best Threshold: %.3f\n", coords_blind$threshold))
+cat(sprintf("  Sensitivity: %.3f (%.1f%%)\n", coords_blind$sensitivity, coords_blind$sensitivity * 100))
+cat(sprintf("  Specificity: %.3f (%.1f%%)\n", coords_blind$specificity, coords_blind$specificity * 100))
+cat(sprintf("  Youden's J: %.3f\n\n", coords_blind$sensitivity + coords_blind$specificity - 1))
+roc_combined <- rbind(
+  data.frame(FPR = 1 - roc1$specificities,   TPR = roc1$sensitivities,   Model = lab_full),
+  data.frame(FPR = 1 - roc_eu$specificities, TPR = roc_eu$sensitivities, Model = lab_eu),
+  data.frame(FPR = 1 - roc_blind$specificities, TPR = roc_blind$sensitivities, Model = lab_blind)
+)
+
+
+roc_combined$Model <- factor(roc_combined$Model, levels = c(lab_full, lab_eu, lab_blind))
+
+color_vec <- setNames(c("#D73027", "#4575B4", "#7F7F7F"), c(lab_full, lab_eu, lab_blind))
+
+p_roc3 <- ggplot(roc_combined, aes(x = FPR, y = TPR, color = Model)) +
+  geom_line(linewidth = 1.35) +
+  geom_abline(
+    slope = 1, intercept = 0,
+    linetype = "dashed", color = "#AAAAAA", linewidth = 0.9
+  ) +
+  scale_color_manual(values = color_vec, name = NULL) +
+  labs(
+    title = "ROC Curve: CPS-6 Discriminates Effective vs Inactive",
+    subtitle = "Full = labeled data | Blind = no CCK-8 (never seen during training)",
+    x = "1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    aspect.ratio = 1,
+    legend.position = "bottom",
+    legend.text = element_text(size = 9.5, lineheight = 1.15),
+    legend.key.height = unit(1.2, "lines"),
+
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5, margin = ggplot2::margin(b = 6)),
+    plot.subtitle = element_text(size = 10.5, hjust = 0.5, color = "#555555"),
+    axis.title = element_text(size = 11, face = "bold"),
+    axis.text = element_text(size = 10),
+    panel.grid.major = element_line(color = "#EDEDED", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "#BFBFBF", linewidth = 0.6)
+  ) +
+  guides(color = guide_legend(nrow = 3, byrow = TRUE))
+
+print(p_roc3)
+
+# Scatter plot
+clr_blue_theme <- c(
+    Effective = "#E89ABE",
+    Marginal  = "#cccccc",
+    Inactive  = "#74A9CF",
+    `No Label` = "#f0f0f0"
+)
+
+sv_labeled <- cps6 %>%
+    filter(!is.na(Inhibition_Rate)) %>%
+    mutate(
+        Label = case_when(
+            Classification == "Effective" ~ "Effective",
+            Classification == "Marginal"  ~ "Marginal",
+            Classification == "Inactive"  ~ "Inactive",
+            TRUE ~ "No Label"
+        ),
+        Label = factor(Label, levels = c("Effective", "Marginal", "Inactive", "No Label"))
+    )
+
+rho_all <- cor.test(
+    sv_labeled$cps6, sv_labeled$Inhibition_Rate,
+    method = "spearman", exact = FALSE
+)
+
+# Plot
+p_main <- ggplot(sv_labeled, aes(x = cps6, y = Inhibition_Rate)) +
+    geom_point(
+        data = sv_labeled %>% filter(Label == "No Label"),
+        aes(color = cps6),
+        size = 2, alpha = 0.5
+    ) +
+    geom_point(
+        data = sv_labeled %>% filter(Label != "No Label"),
+        aes(fill = Label, color = cps6),
+        size = 2.5, alpha = 1, shape = 21, stroke = 0.5
+    ) +
+    scale_color_gradient(
+        low = "#deebf7",
+        high = "#5F6A8F",
+        name = "CPS-6 Score",
+        guide = guide_colorbar(order = 1)
+    ) +
+    scale_fill_manual(
+        values = clr_blue_theme,
+        name = "Classification",
+        guide = guide_legend(order = 2, override.aes = list(size = 1, stroke = 0, shape = 21))
+    ) +
+    geom_smooth(
+        method = "lm", se = TRUE,
+        color = "#5F6A8F", linetype = "dashed",
+        linewidth = 1, alpha = 0.2
+    ) +
+    annotate(
+        "text",
+        x = min(sv_labeled$cps6) + 0.05 * diff(range(sv_labeled$cps6)),
+        y = max(sv_labeled$Inhibition_Rate) - 0.05 * diff(range(sv_labeled$Inhibition_Rate)),
+        label = sprintf(
+            "Spearman ρ = %.3f\np = %.2e\nn = %d",
+            rho_all$estimate, rho_all$p.value, nrow(sv_labeled)
+        ),
+        hjust = 0, vjust = 1, size = 4,
+        color = "black", fontface = "bold",
+        lineheight = 0.9
+    ) +
+    labs(
+        title = "CPS-6 Signature vs Cell Growth Inhibition",
+        subtitle = "Point color gradient = CPS-6 score; Border color = Classification",
+        x = "CPS-6 Score",
+        y = "Inhibition (%)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+        plot.title = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(size = 10, color = "gray30"),
+        legend.position = "right",
+        legend.box = "vertical",
+        legend.spacing.y = unit(0.3, "cm"),
+        aspect.ratio = 1,
+        panel.grid.minor = element_blank()
+    )
+
+print(p_main)
+
+fig_scatter <- (p_main | p_roc3) +
+  plot_annotation(
+    title = "CPS-6 Validation",
+    theme = theme(plot.title = element_text(size = 15, face = "bold"))
+  )
+
+print(fig_scatter)
+
+ write.xlsx(sv_labeled, file.path(data_dir, "Plot03_CPS6_inhibition.xlsx"))
+ggsave(file.path(fig_dir, "Plot03_CPS6_inhibition.pdf"), p_main, width = 7, height = 7)
+ write.xlsx(roc_combined, file.path(data_dir, "Plot04_CPS6_ROC.xlsx"))
+ ggsave(file.path(fig_dir, "Plot04_CPS6_ROC.pdf"), p_roc3, width = 7, height = 7)
+# save.image("CPS6.RData")
+```
+
+#CPS-6 analysis
+```{r}
+# ═══════════════════════════════════════════════════════════════
+# PART 0B: Compound Similarity & Grouping Analysis
+# ═══════════════════════════════════════════════════════════════
+
+library(openxlsx)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pheatmap)
+library(dendextend)
+
+# ── 1. Data Loading ──────────────────────────────────────────
+
+compound_annotation <- read.csv(file.path(input_dir, "Table S1-Compound information.csv"))
+
+# Inspect the data
+cat("Total compounds:", nrow(compound_annotation), "\n")
+cat("Columns:", paste(colnames(compound_annotation), collapse = ", "), "\n\n")
+
+# Inspect the distribution of variant types
+cat("Variant type distribution:\n")
+print(table(compound_annotation$Variant_Type, useNA = "ifany"))
+
+# Inspect active ingredients with multiple forms
+cat("\nActive ingredients with multiple forms:\n")
+api_counts <- compound_annotation %>%
+  filter(!is.na(Active_Ingredient)) %>%
+  group_by(Active_Ingredient) %>%
+  summarise(
+    N_Forms = n(),
+    Forms = paste(Variant_Type, collapse = "; "),
+    Compound_IDs = paste(Compound_ID, collapse = ", ")
+  ) %>%
+  arrange(desc(N_Forms))
+
+print(api_counts %>% filter(N_Forms > 1))
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════
+# 2. API-Based Grouping (Active Ingredient Grouping)
+# ══════════════════════════════════════════════════════════════
+
+api_grouping <- compound_annotation %>%
+  mutate(
+    API = ifelse(
+      is.na(Active_Ingredient) | Active_Ingredient == "",
+      Compound_Name,
+      Active_Ingredient
+    )
+  ) %>%
+  group_by(API) %>%
+  mutate(
+    API_Group_ID = cur_group_id(),
+    API_Group_Size = n(),
+    Is_Active_Moiety = Variant_Type == "Active moiety",
+    Has_Variants = API_Group_Size > 1
+  ) %>%
+  ungroup()
+
+cat(sprintf(
+  "\n═══ API Grouping Summary ═══\n"
+))
+cat(sprintf("Total unique APIs: %d\n", n_distinct(api_grouping$API)))
+cat(sprintf("APIs with multiple forms: %d\n", sum(api_grouping$Has_Variants & api_grouping$Is_Active_Moiety)))
+cat(sprintf("Total compound forms: %d\n", nrow(api_grouping)))
+
+# Export detailed API grouping information
+api_group_detail <- api_grouping %>%
+  filter(Has_Variants) %>%
+  select(API, Compound_ID, Compound_Name, Variant_Type, API_Group_ID, API_Group_Size) %>%
+  arrange(API, Variant_Type)
+
+write.xlsx(api_group_detail,file.path(data_dir,"01_API_Grouping_Details.xlsx"))
+```
+
+```{r}
+smiles_data <- api_grouping %>%
+  filter(!is.na(SMILES) & SMILES != "" & SMILES != "NA") %>%
+  select(Compound_ID, Compound_Name, SMILES, API_Group_ID)
+
+cat(sprintf("\nCompounds with valid SMILES: %d\n", nrow(smiles_data)))
+
+
+if (requireNamespace("ChemmineR", quietly = TRUE)) {
+  
+  library(ChemmineR)
+  
+  cat("\nPerforming chemical similarity analysis using ChemmineR...\n")
+  
+  # Convert SMILES to SDF
+  sdf_list <- tryCatch({
+    smiles_vec <- setNames(smiles_data$SMILES, smiles_data$Compound_ID)
+    smiles2sdf <- smiles2sdf(smiles_vec)
+    smiles2sdf
+  }, error = function(e) {
+    cat("SMILES conversion failed, possibly due to invalid structures. Checking individually...\n")
+    NULL
+  })
+  
+  if (!is.null(sdf_list)) {
+    # Generate molecular fingerprints (ECFP-like: AP - Atom Pair)
+    apset <- sdf2ap(sdf_list)
+    
+    # Calculate the Tanimoto similarity matrix
+    sim_matrix <- sapply(cid(apset), function(x) {
+      sapply(cid(apset), function(y) {
+        cmp.similarity(apset[x], apset[y])
+      })
+    })
+    
+    rownames(sim_matrix) <- colnames(sim_matrix) <- names(sdf_list)
+    
+    cat(sprintf("Similarity matrix dimensions: %d × %d\n", nrow(sim_matrix), ncol(sim_matrix)))
+    
+    # Convert to a distance matrix
+    dist_matrix <- as.dist(1 - sim_matrix)
+    
+  } else {
+    cat("⚠️ ChemmineR approach failed\n")
+    sim_matrix <- NULL
+  }
+  
+} else {
+  cat("⚠️ ChemmineR is not installed. To install it, run:\n")
+  cat('  if (!requireNamespace("BiocManager")) install.packages("BiocManager")\n')
+  cat('  BiocManager::install("ChemmineR")\n\n')
+  sim_matrix <- NULL
+}
+
+if (is.null(sim_matrix)) {
+  
+  cat("\n═══ No R cheminformatics package is available ═══\n")
+  cat("Exporting SMILES for processing with Python RDKit...\n\n")
+  
+  write.csv(
+    smiles_data %>% select(Compound_ID, SMILES),
+    file.path(data_dir, "smiles_for_python.csv"),
+    row.names = FALSE
+  )
+  
+  cat("Exported: smiles_for_python.csv\n")
+  cat("Please run the following Python script:\n\n")
+  
+  cat('
+# ═══════════════════════════════════════════════════════════
+# Python Script: calculate_tanimoto.py
+# ═══════════════════════════════════════════════════════════
+
+import pandas as pd
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit import DataStructs
+import numpy as np
+
+# Load data
+df = pd.read_csv("smiles_for_python.csv")
+
+# Generate molecular objects
+df["mol"] = df["SMILES"].apply(lambda x: Chem.MolFromSmiles(x))
+df = df[df["mol"].notna()].reset_index(drop=True)
+
+print(f"Valid molecules: {len(df)}")
+
+# Generate ECFP4 fingerprints
+df["fp"] = df["mol"].apply(lambda x: AllChem.GetMorganFingerprintAsBitVect(x, 2, nBits=2048))
+
+# Calculate the Tanimoto similarity matrix
+n = len(df)
+sim_matrix = np.zeros((n, n))
+
+for i in range(n):
+    for j in range(i, n):
+        sim = DataStructs.TanimotoSimilarity(df["fp"].iloc[i], df["fp"].iloc[j])
+        sim_matrix[i, j] = sim_matrix[j, i] = sim
+
+# Convert to DataFrame
+sim_df = pd.DataFrame(
+    sim_matrix,
+    index=df["Compound_ID"],
+    columns=df["Compound_ID"]
+)
+
+# Export
+sim_df.to_csv("tanimoto_similarity_matrix.csv")
+print("✓ Exported: tanimoto_similarity_matrix.csv")
+')
+
+cat("\nAfter running the script, place tanimoto_similarity_matrix.csv in the same directory\n")
+cat("and then continue running the R code.\n\n")
+```
+
+
+```{r}
+# Check whether a similarity matrix generated by Python is already available
+similarity_file <- if (file.exists(file.path(input_dir, "tanimoto_similarity_matrix.csv"))) {
+  file.path(input_dir, "tanimoto_similarity_matrix.csv")
+} else if (file.exists(file.path(data_dir, "tanimoto_similarity_matrix.csv"))) {
+  file.path(data_dir, "tanimoto_similarity_matrix.csv")
+} else {
+  NA_character_
+}
+
+if (!is.na(similarity_file)) {
+  sim_matrix <- read.csv(similarity_file, row.names = 1)
+  sim_matrix <- as.matrix(sim_matrix)
+  dist_matrix <- as.dist(1 - sim_matrix)
+  cat("✓ Loaded the similarity matrix generated by Python\n")
+}
+
+```
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════
+# 4. Clustering Based on Chemical Similarity
+# ══════════════════════════════════════════════════════════════
+
+if (!is.null(sim_matrix)) {
+  
+  # 4.1 Hierarchical clustering
+  hc <- hclust(dist_matrix, method = "average")
+  
+  # 4.2 Cut the dendrogram at different thresholds
+  # Tanimoto > 0.85 → distance < 0.15
+  SIMILARITY_THRESHOLD <- 0.85
+  clusters <- cutree(hc, h = 1 - SIMILARITY_THRESHOLD)
+  
+  cluster_df <- data.frame(
+    Compound_ID = names(clusters),
+    Similarity_Cluster = clusters,
+    stringsAsFactors = FALSE
+  )
+  
+  # Summary statistics
+  cluster_summary <- cluster_df %>%
+    group_by(Similarity_Cluster) %>%
+    summarise(
+      N_Compounds = n(),
+      Compound_IDs = paste(Compound_ID, collapse = ", ")
+    ) %>%
+    arrange(desc(N_Compounds))
+  
+  cat(sprintf(
+    "\n═══ Chemical Similarity Clustering (Tanimoto > %.2f) ═══\n",
+    SIMILARITY_THRESHOLD
+  ))
+  cat(sprintf("Total clusters: %d\n", nrow(cluster_summary)))
+  cat(sprintf("Singletons: %d\n", sum(cluster_summary$N_Compounds == 1)))
+  cat(sprintf("Clusters with ≥2 compounds: %d\n", sum(cluster_summary$N_Compounds >= 2)))
+  
+  cat("\nTop 10 largest clusters:\n")
+  print(head(cluster_summary, 10))
+  
+  # Export
+write.xlsx(cluster_summary, file.path(data_dir,"02_Chemical_Similarity_Clusters.xlsx"))
+  
+  
+  # 4.3 Visualize the chemical similarity heatmap
+  # Display only the subset containing chemically similar compounds
+  large_clusters <- cluster_summary %>% filter(N_Compounds >= 2) %>% pull(Similarity_Cluster)
+  
+  if (length(large_clusters) > 0) {
+    
+    compounds_in_clusters <- cluster_df %>%
+      filter(Similarity_Cluster %in% large_clusters) %>%
+      pull(Compound_ID)
+    
+    sim_subset <- sim_matrix[
+      rownames(sim_matrix) %in% compounds_in_clusters,
+      colnames(sim_matrix) %in% compounds_in_clusters
+    ]
+    
+    # Heatmap annotation
+    annotation_df <- cluster_df %>%
+      filter(Compound_ID %in% compounds_in_clusters) %>%
+      column_to_rownames("Compound_ID")
+    
+    pdf(file.path(fig_dir, "Chemical_Similarity_Heatmap.pdf"), width = 10, height = 10)
+    pheatmap(
+      sim_subset,
+      clustering_distance_rows = dist_matrix,
+      clustering_distance_cols = dist_matrix,
+      clustering_method = "average",
+      annotation_row = annotation_df,
+      annotation_col = annotation_df,
+      color = colorRampPalette(c("white", "#deebf7", "#3182bd"))(100),
+      main = sprintf("Chemical Similarity (Tanimoto, threshold=%.2f)", SIMILARITY_THRESHOLD),
+      fontsize = 8
+    )
+    dev.off()
+    
+    cat("\n✓ Heatmap saved: Chemical_Similarity_Heatmap.pdf\n")
+  }
+  
+  
+  # 4.4 Dendrogram visualization
+  pdf(file.path(fig_dir, "Chemical_Similarity_Dendrogram.pdf"), width = 12, height = 6)
+  
+  dend <- as.dendrogram(hc)
+  dend <- color_branches(dend, h = 1 - SIMILARITY_THRESHOLD, groupLabels = TRUE)
+  
+  plot(dend, main = sprintf("Hierarchical Clustering (Tanimoto Similarity, cut at %.2f)", SIMILARITY_THRESHOLD))
+  abline(h = 1 - SIMILARITY_THRESHOLD, col = "red", lty = 2, lwd = 2)
+  
+  dev.off()
+  
+  cat("✓ Dendrogram saved: Chemical_Similarity_Dendrogram.pdf\n")
+  
+} else {
+  
+  cat("\n⚠️ Skipping chemical similarity clustering because the similarity matrix was not generated\n")
+  cluster_df <- data.frame(
+    Compound_ID = smiles_data$Compound_ID,
+    Similarity_Cluster = 1:nrow(smiles_data)  # Assign each compound to an individual group
+  )
+  
+}# Ignore errors
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════
+# 5. MOA/Target-Based Grouping
+# ══════════════════════════════════════════════════════════════
+
+moa_grouping <- api_grouping %>%
+  mutate(
+    # Clean Primary_Target
+    Primary_Target_Clean = ifelse(
+      is.na(Primary_Target) | Primary_Target == "" | Primary_Target == "Unknown",
+      "Unknown",
+      Primary_Target
+    )
+  ) %>%
+  group_by(Primary_Target_Clean) %>%
+  mutate(
+    MOA_Group_ID = cur_group_id(),
+    MOA_Group_Size = n()
+  ) %>%
+  ungroup()
+
+cat(sprintf(
+  "\n═══ MOA/Target Grouping Summary ═══\n"
+))
+cat(sprintf("Total unique targets: %d\n", n_distinct(moa_grouping$Primary_Target_Clean)))
+cat(sprintf("Compounds with known target: %d\n", sum(moa_grouping$Primary_Target_Clean != "Unknown")))
+cat(sprintf("Compounds with unknown target: %d\n", sum(moa_grouping$Primary_Target_Clean == "Unknown")))
+
+# Target distribution
+target_distribution <- moa_grouping %>%
+  group_by(Primary_Target_Clean) %>%
+  summarise(
+    N_Compounds = n(),
+    Class = paste(unique(Class), collapse = "; "),
+    Subclass = paste(unique(Subclass), collapse = "; ")
+  ) %>%
+  arrange(desc(N_Compounds))
+
+cat("\nTop 15 most common targets:\n")
+print(head(target_distribution, 15))
+
+# Export
+write.xlsx(target_distribution, file.path(data_dir,"03_MOA_Target_Distribution.xlsx"))
+```
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════
+# 6. Integrate All Grouping Information
+# ══════════════════════════════════════════════════════════════
+
+compound_grouping_final <- moa_grouping %>%
+  left_join(
+    cluster_df %>% select(Compound_ID, Similarity_Cluster),
+    by = "Compound_ID"
+  ) %>%
+  mutate(
+    # Assign a unique ID to compounds without chemical similarity clustering information
+    Similarity_Cluster = ifelse(
+      is.na(Similarity_Cluster),
+      max(Similarity_Cluster, na.rm = TRUE) + row_number(),
+      Similarity_Cluster
+    )
+  ) %>%
+  select(
+    Compound_ID, Compound_Name, Variant_Type, Active_Ingredient,
+    API, API_Group_ID, API_Group_Size, Has_Variants,
+    Primary_Target_Clean, MOA_Group_ID, MOA_Group_Size,
+    Similarity_Cluster,
+    SMILES, Class, Subclass, Pathways,
+    everything()
+  )
+
+# Export the final grouping table
+write.xlsx(
+  compound_grouping_final,
+  file.path(data_dir,"04_Compound_Grouping_Complete.xlsx"
+))
+
+```
+
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════
+# 7. Cross-Tabulation of Grouping Strategies
+# ══════════════════════════════════════════════════════════════
+
+# Overlap between API grouping and chemical similarity grouping
+api_vs_similarity <- compound_grouping_final %>%
+  filter(Has_Variants) %>%
+  group_by(API_Group_ID) %>%
+  summarise(
+    API = first(API),
+    N_Compounds = n(),
+    N_Similarity_Clusters = n_distinct(Similarity_Cluster),
+    Match = N_Similarity_Clusters == 1  # Whether variants of the same API fall into the same chemical cluster
+  )
+
+cat(sprintf(
+  "\n═══ API vs Chemical Similarity Consistency ═══\n"
+))
+cat(sprintf(
+  "APIs where all variants cluster together: %d/%d (%.1f%%)\n",
+  sum(api_vs_similarity$Match),
+  nrow(api_vs_similarity),
+  sum(api_vs_similarity$Match) / nrow(api_vs_similarity) * 100
+))
+
+# Consistency between Target and Class
+target_vs_class <- compound_grouping_final %>%
+  filter(Primary_Target_Clean != "Unknown") %>%
+  group_by(Primary_Target_Clean) %>%
+  summarise(
+    N_Compounds = n(),
+    N_Classes = n_distinct(Class),
+    Classes = paste(unique(Class), collapse = "; ")
+  ) %>%
+  arrange(desc(N_Compounds))
+
+cat("\nTargets spanning multiple drug classes:\n")
+print(target_vs_class %>% filter(N_Classes > 1))
+
+
+# ══════════════════════════════════════════════════════════════
+# 8. Visualize Relationships Among Grouping Strategies
+# ══════════════════════════════════════════════════════════════
+
+library(ggalluvial)
+
+# 8.1 Alluvial plot: Class → Target → API groups
+
+plot_data <- compound_grouping_final %>%
+  filter(
+    !is.na(Class),
+    Class != "Others",
+    Primary_Target_Clean != "Unknown",
+    MOA_Group_Size >= 3  # Display only targets represented by at least three compounds
+  ) %>%
+  group_by(Class, Primary_Target_Clean, Has_Variants) %>%
+  summarise(N = n(), .groups = "drop")
+
+p_alluvial <- ggplot(
+  plot_data,
+  aes(axis1 = Class, axis2 = Primary_Target_Clean, y = N)
+) +
+  geom_alluvium(aes(fill = Class), width = 1/12, alpha = 0.7) +
+  geom_stratum(width = 1/12, fill = "gray90", color = "white") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 2.5) +
+  scale_x_discrete(
+    limits = c("Drug Class", "Primary Target"),
+    expand = c(0.05, 0.05)
+  ) +
+  labs(
+    title = "Compound Grouping: Drug Class → Target",
+    y = "Number of Compounds"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.text.y = element_blank(),
+    panel.grid = element_blank()
+  )
+
+p_alluvial
+
+# 8.2 UpSet plot: overlap among grouping criteria
+
+library(UpSetR)
+
+# Prepare binary matrix
+upset_data <- compound_grouping_final %>%
+  mutate(
+    Has_API_Variants = Has_Variants,
+    In_Similarity_Cluster = Similarity_Cluster %in% 
+      (cluster_summary %>% filter(N_Compounds >= 2) %>% pull(Similarity_Cluster)),
+    Has_Known_Target = Primary_Target_Clean != "Unknown",
+    In_Large_Target_Group = MOA_Group_Size >= 5
+  ) %>%
+  select(Compound_ID, Has_API_Variants, In_Similarity_Cluster, 
+         Has_Known_Target, In_Large_Target_Group) %>%
+  mutate(across(where(is.logical), as.integer))
+
+pdf(file.path(fig_dir, "Compound_Grouping_Upset.pdf"), width = 10, height = 6)
+upset(
+  as.data.frame(upset_data %>% select(-Compound_ID)),
+  sets = c("Has_API_Variants", "In_Similarity_Cluster", 
+           "Has_Known_Target", "In_Large_Target_Group"),
+  order.by = "freq",
+  main.bar.color = "#3182bd",
+  sets.bar.color = "#e41a1c",
+  text.scale = 1.5
+)
+dev.off()
+
+```
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════
+# 9. Generate Grouping Variables for Cross-Validation
+# ══════════════════════════════════════════════════════════════
+
+cv_grouping <- compound_grouping_final %>%
+  dplyr::select(
+    Compound_ID,
+    API_Group = API_Group_ID,
+    Similarity_Group = Similarity_Cluster,
+    MOA_Group = MOA_Group_ID
+  ) %>%
+  mutate(
+    Combined_Group = paste(API_Group, Similarity_Group, sep = "_"),
+    Combined_Group_ID = as.integer(factor(Combined_Group))
+  )
+
+# Export
+write.xlsx(cv_grouping, file.path(data_dir,"05_CV_Grouping_Variables.xlsx"))#Important: after export, replace drug IDs with names, save as 06__CV_Grouping_Variables.xlsx, and pay special attention to the plus/minus signs
+
+cat("\n✓ CV grouping variables exported: CV_Grouping_Variables.xlsx\n")
+
+# Summarize the number of groups under each grouping strategy
+cat("\n═══ CV Grouping Strategy Summary ═══\n")
+cat(sprintf("API-based groups: %d\n", n_distinct(cv_grouping$API_Group)))
+cat(sprintf("Similarity-based groups: %d\n", n_distinct(cv_grouping$Similarity_Group)))
+cat(sprintf("MOA-based groups: %d\n", n_distinct(cv_grouping$MOA_Group)))
+cat(sprintf("Combined (API + Similarity) groups: %d\n", n_distinct(cv_grouping$Combined_Group_ID)))
+```
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════
+# 10. Merge with l2fc_matrix
+# ══════════════════════════════════════════════════════════════
+cv_grouping<-read.xlsx(file.path(input_dir, "06_CV_Grouping_Variables.xlsx"))
+
+# Assume that l2fc_matrix and compound_metrics are already available
+compound_metrics <- compound_metrics %>%
+  left_join(
+    cv_grouping,
+    by = c("Compound" = "Compound_ID")
+  ) %>%
+  left_join(
+    compound_grouping_final %>%
+      select(
+        Compound_ID,
+        API,
+        Primary_Target_Clean,
+        Class,
+        Subclass
+      ),
+    by = c("Compound" = "Compound_ID")
+  )
+
+cat("\n✓ Grouping variables merged into compound_metrics\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════
+# 11. Export Analysis Report
+# ══════════════════════════════════════════════════════════════
+report <- list(
+  "API_Groups" = api_counts,
+  "Similarity_Clusters" = cluster_summary,
+  "Target_Distribution" = target_distribution,
+  "API_vs_Similarity" = api_vs_similarity,
+  "Target_vs_Class" = target_vs_class,
+  "CV_Grouping_Summary" = cv_grouping %>%
+    summarise(
+      across(ends_with("Group"), n_distinct, .names = "N_{.col}")
+    ) %>%
+    pivot_longer(everything(), names_to = "Strategy", values_to = "N_Groups")
+)
+
+write.xlsx(report, file.path(data_dir,"07_Compound_Grouping_Report.xlsx"))
+
+cat("\n✓ Complete report exported: Compound_Grouping_Report.xlsx\n")
+
+cat("\n══════════════════════════════════════════════════════════\n")
+cat("  All grouping analyses complete!\n")
+cat("══════════════════════════════════════════════════════════\n\n")
+```
+
+```{r Preparing for leave-one-group-out analysis}
+# ═══════════════════════════════════════════════════════════════
+# Step 0: Data Integrity Check
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n═══ Data Preparation Check ═══\n")
+
+# 1. Check whether all required objects exist
+required_objects <- c("l2fc_matrix", "compound_metrics", "X_clean", "y_clean", 
+                      "X_final", "penalty_final", "core_proteins")
+
+for (obj in required_objects) {
+  if (!exists(obj)) {
+    stop(sprintf("❌ Missing object: %s", obj))
+  } else {
+    cat(sprintf("✓ %s loaded\n", obj))
+  }
+}
+
+# 2. Check grouping-information columns
+required_columns <- c("Compound", "Inhibition_Rate", "API_Group", 
+                      "Similarity_Group", "MOA_Group")
+
+missing_cols <- setdiff(required_columns, colnames(compound_metrics))
+if (length(missing_cols) > 0) {
+  stop(sprintf("❌ compound_metrics is missing the following columns: %s\nPlease run the grouping analysis in PART 0B first", 
+               paste(missing_cols, collapse = ", ")))
+} else {
+  cat("\n✓ All required columns are present\n")
+}
+
+# 3. Check data alignment
+cat("\nChecking data alignment:\n")
+cat(sprintf("  Number of rows in compound_metrics: %d\n", nrow(compound_metrics)))
+cat(sprintf("  Number of rows in X_clean: %d\n", nrow(X_clean)))
+cat(sprintf("  Length of y_clean: %d\n", length(y_clean)))
+cat(sprintf("  Number of columns in X_final: %d (should include %d core proteins + Log10_Conc)\n", 
+            ncol(X_final), length(core_proteins)))
+
+# 4. Check grouping-information coverage
+cat("\nGrouping information summary:\n")
+cat(sprintf("  API_Group available: %d/%d (%.1f%%)\n",
+            sum(!is.na(compound_metrics$API_Group)),
+            nrow(compound_metrics),
+            sum(!is.na(compound_metrics$API_Group)) / nrow(compound_metrics) * 100))
+
+cat(sprintf("  Similarity_Group available: %d/%d (%.1f%%)\n",
+            sum(!is.na(compound_metrics$Similarity_Group)),
+            nrow(compound_metrics),
+            sum(!is.na(compound_metrics$Similarity_Group)) / nrow(compound_metrics) * 100))
+
+cat(sprintf("  MOA_Group available: %d/%d (%.1f%%)\n",
+            sum(!is.na(compound_metrics$MOA_Group) & compound_metrics$MOA_Group != "Unknown"),
+            nrow(compound_metrics),
+            sum(!is.na(compound_metrics$MOA_Group) & compound_metrics$MOA_Group != "Unknown") / nrow(compound_metrics) * 100))
+
+# 5. Check Compound ID alignment
+compounds_in_metrics <- compound_metrics$Compound
+compounds_in_matrix <- colnames(l2fc_matrix)
+compounds_in_X <- rownames(X_clean)
+
+cat("\nCompound ID alignment check:\n")
+cat(sprintf("  Matches between compound_metrics and l2fc_matrix: %d/%d\n",
+            sum(compounds_in_metrics %in% compounds_in_matrix),
+            length(compounds_in_metrics)))
+
+cat(sprintf("  Matches between compound_metrics and X_clean rownames: %d/%d\n",
+            sum(compounds_in_metrics %in% compounds_in_X),
+            length(compounds_in_metrics)))
+
+if (!all(compounds_in_X %in% compounds_in_metrics)) {
+  cat("\n⚠️ Warning: X_clean rownames do not fully match compound_metrics$Compound\n")
+  cat("   Attempting alignment...\n")
+  
+  # Attempt automatic correction
+  # Here, X_clean rownames are assumed to correspond to compound IDs
+  # If not, the mapping relationship must be specified manually
+}
+
+cat("\n✅ Data check complete! Validation analysis can now proceed.\n\n")
+```
+
+```{r}
+# ═══════════════════════════════════════════════════════════════
+# Step 1: Prepare the Dataset for Validation
+# ═══════════════════════════════════════════════════════════════
+
+library(dplyr)
+
+# Create the complete modeling data frame using only compounds with inhibition-rate measurements
+modeling_data <- compound_metrics %>%
+  filter(!is.na(Inhibition_Rate)) %>%
+  mutate(
+    # Handle missing grouping IDs
+    API_Group = ifelse(
+      is.na(API_Group) | API_Group == "", 
+      paste0("Single_API_", row_number()), 
+      as.character(API_Group)
+    ),
+    
+    Similarity_Group = ifelse(
+      is.na(Similarity_Group) | Similarity_Group == "", 
+      paste0("Single_Cluster_", row_number()), 
+      as.character(Similarity_Group)
+    ),
+    
+    MOA_Group = ifelse(
+      is.na(MOA_Group) | MOA_Group == "" | MOA_Group == "Unknown", 
+      "Unknown", 
+      as.character(MOA_Group)
+    ),
+    
+    # Create a combined grouping variable (most conservative strategy)
+    Combined_Group = paste(API_Group, Similarity_Group, sep = "_")
+  ) %>%
+  mutate(
+    Combined_Group_ID = as.integer(factor(Combined_Group))
+  )
+
+cat(sprintf("Total compounds available for validation: %d\n", nrow(modeling_data)))
+
+# Summarize each grouping strategy
+cat("\nNumber of groups under each grouping strategy:\n")
+cat(sprintf("  API groups: %d\n", n_distinct(modeling_data$API_Group)))
+cat(sprintf("  Similarity clusters: %d\n", n_distinct(modeling_data$Similarity_Group)))
+cat(sprintf("  MOA groups (excluding Unknown): %d\n", 
+            n_distinct(modeling_data$MOA_Group[modeling_data$MOA_Group != "Unknown"])))
+cat(sprintf("  Combined groups: %d\n", n_distinct(modeling_data$Combined_Group_ID)))
+
+# Save for subsequent use
+write.xlsx(modeling_data, file.path(data_dir,"modeling_data_with_groups.xlsx"), rowNames = FALSE)
+```
+
+```{r}
+# ═══════════════════════════════════════════════════════════════
+# VALIDATION 1: Leave-One-API-Out CV
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("  Starting Validation 1/3: Leave-One-API-Out Cross-Validation\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+
+library(glmnet)
+
+# Summarize API group sizes
+api_group_sizes <- modeling_data %>%
+  group_by(API_Group) %>%
+  summarise(N = n(), .groups = 'drop') %>%
+  arrange(desc(N))
+
+cat("API group-size distribution:\n")
+print(table(api_group_sizes$N))
+
+# Test only API groups with at least two samples
+api_groups_to_test <- api_group_sizes %>%
+  filter(N >= 2) %>%
+  pull(API_Group)
+
+cat(sprintf("\nNumber of API groups to test: %d\n", length(api_groups_to_test)))
+cat(sprintf("Compound coverage: %d/%d (%.1f%%)\n\n",
+            sum(modeling_data$API_Group %in% api_groups_to_test),
+            nrow(modeling_data),
+            sum(modeling_data$API_Group %in% api_groups_to_test) / nrow(modeling_data) * 100))
+
+# Initialize result containers
+api_cv_results <- list()
+api_cv_predictions <- data.frame()
+
+# Progress bar
+pb <- txtProgressBar(min = 0, max = length(api_groups_to_test), style = 3)
+
+# Start Leave-One-API-Out CV
+for (i in seq_along(api_groups_to_test)) {
+  
+  test_api <- api_groups_to_test[i]
+  
+  # Obtain training/test compounds
+  train_compounds <- modeling_data %>% 
+    filter(API_Group != test_api) %>% 
+    pull(Compound)
+  
+  test_compounds <- modeling_data %>% 
+    filter(API_Group == test_api) %>% 
+    pull(Compound)
+  
+  # Identify indices in X_final
+  # Note: rownames of X_final should correspond to compound IDs
+  train_idx <- which(rownames(X_final) %in% train_compounds)
+  test_idx <- which(rownames(X_final) %in% test_compounds)
+  
+  # Skip cases where the training set is too small
+  if (length(train_idx) < 30 || length(test_idx) < 2) {
+    next
+  }
+  
+  # Prepare training/test data
+  X_train <- X_final[train_idx, , drop = FALSE]
+  y_train <- y_clean[train_idx]
+  X_test <- X_final[test_idx, , drop = FALSE]
+  y_test <- y_clean[test_idx]
+  
+  # Train Elastic Net
+  cv_fit <- cv.glmnet(
+    X_train, y_train,
+    alpha = 0.5,
+    nfolds = min(5, length(train_idx)),
+    penalty.factor = penalty_final
+  )
+  
+  # Predict
+  pred <- predict(cv_fit, X_test, s = "lambda.min")[, 1]
+  
+  # Calculate performance metrics
+  if (length(pred) >= 2 && sd(pred) > 0) {
+    r2 <- cor(pred, y_test, use = "complete.obs")^2
+    rho_test <- cor.test(pred, y_test, method = "spearman", exact = FALSE)
+    mae <- mean(abs(pred - y_test))
+    rmse <- sqrt(mean((pred - y_test)^2))
+  } else {
+    r2 <- NA; rho_test <- list(estimate = NA, p.value = NA)
+    mae <- NA; rmse <- NA
+  }
+  
+  # Save fold-level metrics
+  api_cv_results[[i]] <- data.frame(
+    Fold = i,
+    API_Group = test_api,
+    N_Train = length(train_idx),
+    N_Test = length(test_idx),
+    R2 = r2,
+    Spearman_rho = rho_test$estimate,
+    Spearman_p = rho_test$p.value,
+    MAE = mae,
+    RMSE = rmse,
+    stringsAsFactors = FALSE
+  )
+  
+  # Save predictions
+  api_cv_predictions <- rbind(api_cv_predictions, data.frame(
+    Compound = test_compounds,
+    Observed = y_test,
+    Predicted = pred,
+    API_Group = test_api,
+    Fold = i,
+    stringsAsFactors = FALSE
+  ))
+  
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# Combine fold-level metrics
+api_cv_metrics <- bind_rows(api_cv_results)
+
+# Calculate overall performance
+api_overall_rho <- cor.test(
+  api_cv_predictions$Predicted,
+  api_cv_predictions$Observed,
+  method = "spearman",
+  exact = FALSE
+)
+
+api_overall_r2 <- cor(
+  api_cv_predictions$Predicted,
+  api_cv_predictions$Observed,
+  use = "complete.obs"
+)^2
+
+# Report results
+cat("\n\n★ Leave-One-API-Out CV Summary ★\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat(sprintf("Completed folds: %d\n", nrow(api_cv_metrics)))
+cat(sprintf("Total predicted samples: %d\n", nrow(api_cv_predictions)))
+cat(sprintf("\n【Overall Performance】\n"))
+cat(sprintf("  Spearman ρ: %.3f (p = %.2e)\n", 
+            api_overall_rho$estimate, api_overall_rho$p.value))
+cat(sprintf("  R²: %.3f\n", api_overall_r2))
+cat(sprintf("\n【Mean Fold Performance】\n"))
+cat(sprintf("  R²: %.3f ± %.3f\n", 
+            mean(api_cv_metrics$R2, na.rm = TRUE), 
+            sd(api_cv_metrics$R2, na.rm = TRUE)))
+cat(sprintf("  MAE: %.2f ± %.2f\n", 
+            mean(api_cv_metrics$MAE, na.rm = TRUE), 
+            sd(api_cv_metrics$MAE, na.rm = TRUE)))
+cat(sprintf("  RMSE: %.2f ± %.2f\n", 
+            mean(api_cv_metrics$RMSE, na.rm = TRUE), 
+            sd(api_cv_metrics$RMSE, na.rm = TRUE)))
+
+# Save results
+library(openxlsx)
+write.xlsx(
+  list(
+    "Summary" = data.frame(
+      Metric = c("Overall_Spearman_rho", "Overall_R2", "Mean_Fold_R2", "Mean_MAE", "Mean_RMSE"),
+      Value = c(api_overall_rho$estimate, api_overall_r2, 
+                mean(api_cv_metrics$R2, na.rm = TRUE),
+                mean(api_cv_metrics$MAE, na.rm = TRUE),
+                mean(api_cv_metrics$RMSE, na.rm = TRUE))
+    ),
+    "Fold_Metrics" = api_cv_metrics,
+    "Predictions" = api_cv_predictions
+  ),
+  file.path(data_dir,"Leave_One_API_Out_Results.xlsx"
+))
+
+cat("\n✓ Results saved: Leave_One_API_Out_Results.xlsx\n")
+```
+
+
+```{r}
+# ═══════════════════════════════════════════════════════════════
+# VALIDATION 2: Leave-One-Cluster-Out CV
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("  Starting Validation 2/3: Leave-One-Cluster-Out Cross-Validation\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+
+# Summarize cluster sizes
+cluster_sizes <- modeling_data %>%
+  group_by(Similarity_Group) %>%
+  summarise(N = n(), .groups = 'drop') %>%
+  arrange(desc(N))
+
+cat("Chemical similarity cluster-size distribution:\n")
+print(table(cluster_sizes$N))
+
+# Test only clusters with N ≥ 2
+clusters_to_test <- cluster_sizes %>%
+  filter(N >= 2) %>%
+  pull(Similarity_Group)
+
+cat(sprintf("\nNumber of clusters to test: %d\n", length(clusters_to_test)))
+cat(sprintf("Compound coverage: %d/%d (%.1f%%)\n\n",
+            sum(modeling_data$Similarity_Group %in% clusters_to_test),
+            nrow(modeling_data),
+            sum(modeling_data$Similarity_Group %in% clusters_to_test) / nrow(modeling_data) * 100))
+
+# Initialize result containers
+cluster_cv_results <- list()
+cluster_cv_predictions <- data.frame()
+
+# Progress bar
+pb <- txtProgressBar(min = 0, max = length(clusters_to_test), style = 3)
+
+# Leave-One-Cluster-Out
+for (i in seq_along(clusters_to_test)) {
+  
+  test_cluster <- clusters_to_test[i]
+  
+  train_compounds <- modeling_data %>% 
+    filter(Similarity_Group != test_cluster) %>% 
+    pull(Compound)
+  
+  test_compounds <- modeling_data %>% 
+    filter(Similarity_Group == test_cluster) %>% 
+    pull(Compound)
+  
+  train_idx <- which(rownames(X_final) %in% train_compounds)
+  test_idx <- which(rownames(X_final) %in% test_compounds)
+  
+  if (length(train_idx) < 30 || length(test_idx) < 2) {
+    next
+  }
+  
+  X_train <- X_final[train_idx, , drop = FALSE]
+  y_train <- y_clean[train_idx]
+  X_test <- X_final[test_idx, , drop = FALSE]
+  y_test <- y_clean[test_idx]
+  
+  cv_fit <- cv.glmnet(
+    X_train, y_train,
+    alpha = 0.5,
+    nfolds = min(5, length(train_idx)),
+    penalty.factor = penalty_final
+  )
+  
+  pred <- predict(cv_fit, X_test, s = "lambda.min")[, 1]
+  
+  if (length(pred) >= 2 && sd(pred) > 0) {
+    r2 <- cor(pred, y_test, use = "complete.obs")^2
+    rho_test <- cor.test(pred, y_test, method = "spearman", exact = FALSE)
+    mae <- mean(abs(pred - y_test))
+    rmse <- sqrt(mean((pred - y_test)^2))
+  } else {
+    r2 <- NA; rho_test <- list(estimate = NA, p.value = NA)
+    mae <- NA; rmse <- NA
+  }
+  
+  cluster_cv_results[[i]] <- data.frame(
+    Fold = i,
+    Cluster = test_cluster,
+    N_Train = length(train_idx),
+    N_Test = length(test_idx),
+    R2 = r2,
+    Spearman_rho = rho_test$estimate,
+    Spearman_p = rho_test$p.value,
+    MAE = mae,
+    RMSE = rmse,
+    stringsAsFactors = FALSE
+  )
+  
+  cluster_cv_predictions <- rbind(cluster_cv_predictions, data.frame(
+    Compound = test_compounds,
+    Observed = y_test,
+    Predicted = pred,
+    Cluster = test_cluster,
+    Fold = i,
+    stringsAsFactors = FALSE
+  ))
+  
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# Combine results
+cluster_cv_metrics <- bind_rows(cluster_cv_results)
+
+cluster_overall_rho <- cor.test(
+  cluster_cv_predictions$Predicted,
+  cluster_cv_predictions$Observed,
+  method = "spearman",
+  exact = FALSE
+)
+
+cluster_overall_r2 <- cor(
+  cluster_cv_predictions$Predicted,
+  cluster_cv_predictions$Observed,
+  use = "complete.obs"
+)^2
+
+# Report results
+cat("\n\n★ Leave-One-Cluster-Out CV Summary ★\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat(sprintf("Completed folds: %d\n", nrow(cluster_cv_metrics)))
+cat(sprintf("Total predicted samples: %d\n", nrow(cluster_cv_predictions)))
+cat(sprintf("\n【Overall Performance】\n"))
+cat(sprintf("  Spearman ρ: %.3f (p = %.2e)\n", 
+            cluster_overall_rho$estimate, cluster_overall_rho$p.value))
+cat(sprintf("  R²: %.3f\n", cluster_overall_r2))
+cat(sprintf("\n【Mean Fold Performance】\n"))
+cat(sprintf("  R²: %.3f ± %.3f\n", 
+            mean(cluster_cv_metrics$R2, na.rm = TRUE), 
+            sd(cluster_cv_metrics$R2, na.rm = TRUE)))
+
+# Save results
+write.xlsx(
+  list(
+    "Summary" = data.frame(
+      Metric = c("Overall_Spearman_rho", "Overall_R2", "Mean_Fold_R2"),
+      Value = c(cluster_overall_rho$estimate, cluster_overall_r2, 
+                mean(cluster_cv_metrics$R2, na.rm = TRUE))
+    ),
+    "Fold_Metrics" = cluster_cv_metrics,
+    "Predictions" = cluster_cv_predictions
+  ),
+  file.path(data_dir,"Leave_One_Cluster_Out_Results.xlsx"
+))
+
+
+```
+
+```{r}
+# ═══════════════════════════════════════════════════════════════
+# VALIDATION 3: Leave-One-MOA-Out CV
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("  Starting Validation 3/3: Leave-One-MOA-Out Cross-Validation\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+
+# Summarize MOA group sizes (excluding Unknown)
+moa_sizes <- modeling_data %>%
+  filter(MOA_Group != "Unknown") %>%
+  group_by(MOA_Group) %>%
+  summarise(
+    N = n(),
+    Target = first(Primary_Target_Clean),  # If available
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(N))
+
+cat("MOA/Target group-size distribution:\n")
+print(table(moa_sizes$N))
+
+# Test only MOA groups with N ≥ 5 to ensure statistical robustness
+moa_to_test <- moa_sizes %>%
+  filter(N >= 5) %>%
+  pull(MOA_Group)
+
+cat(sprintf("\nNumber of MOA groups to test: %d\n", length(moa_to_test)))
+cat(sprintf("Compound coverage: %d/%d (%.1f%%)\n\n",
+            sum(modeling_data$MOA_Group %in% moa_to_test),
+            nrow(modeling_data),
+            sum(modeling_data$MOA_Group %in% moa_to_test) / nrow(modeling_data) * 100))
+
+# Initialize result containers
+moa_cv_results <- list()
+moa_cv_predictions <- data.frame()
+
+# Progress bar
+pb <- txtProgressBar(min = 0, max = length(moa_to_test), style = 3)
+
+# Leave-One-MOA-Out
+for (i in seq_along(moa_to_test)) {
+  
+  test_moa <- moa_to_test[i]
+  
+  train_compounds <- modeling_data %>% 
+    filter(MOA_Group != test_moa) %>% 
+    pull(Compound)
+  
+  test_compounds <- modeling_data %>% 
+    filter(MOA_Group == test_moa) %>% 
+    pull(Compound)
+  
+  train_idx <- which(rownames(X_final) %in% train_compounds)
+  test_idx <- which(rownames(X_final) %in% test_compounds)
+  
+  if (length(train_idx) < 30 || length(test_idx) < 3) {
+    next
+  }
+  
+  X_train <- X_final[train_idx, , drop = FALSE]
+  y_train <- y_clean[train_idx]
+  X_test <- X_final[test_idx, , drop = FALSE]
+  y_test <- y_clean[test_idx]
+  
+  cv_fit <- cv.glmnet(
+    X_train, y_train,
+    alpha = 0.5,
+    nfolds = min(5, length(train_idx)),
+    penalty.factor = penalty_final
+  )
+  
+  pred <- predict(cv_fit, X_test, s = "lambda.min")[, 1]
+  
+  if (length(pred) >= 3 && sd(pred) > 0) {
+    r2 <- cor(pred, y_test, use = "complete.obs")^2
+    rho_test <- cor.test(pred, y_test, method = "spearman", exact = FALSE)
+    mae <- mean(abs(pred - y_test))
+    rmse <- sqrt(mean((pred - y_test)^2))
+  } else {
+    r2 <- NA; rho_test <- list(estimate = NA, p.value = NA)
+    mae <- NA; rmse <- NA
+  }
+  
+  # Obtain the target name
+  target_name <- modeling_data %>% 
+    filter(MOA_Group == test_moa) %>% 
+    pull(Primary_Target_Clean) %>% 
+    first()
+  
+  if (is.null(target_name) || is.na(target_name)) {
+    target_name <- test_moa
+  }
+  
+  moa_cv_results[[i]] <- data.frame(
+    Fold = i,
+    MOA_Group = test_moa,
+    Target_Name = target_name,
+    N_Train = length(train_idx),
+    N_Test = length(test_idx),
+    R2 = r2,
+    Spearman_rho = rho_test$estimate,
+    Spearman_p = rho_test$p.value,
+    MAE = mae,
+    RMSE = rmse,
+    stringsAsFactors = FALSE
+  )
+  
+  moa_cv_predictions <- rbind(moa_cv_predictions, data.frame(
+    Compound = test_compounds,
+    Observed = y_test,
+    Predicted = pred,
+    MOA_Group = test_moa,
+    Target = target_name,
+    Fold = i,
+    stringsAsFactors = FALSE
+  ))
+  
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# Combine results
+moa_cv_metrics <- bind_rows(moa_cv_results)
+
+moa_overall_rho <- cor.test(
+  moa_cv_predictions$Predicted,
+  moa_cv_predictions$Observed,
+  method = "spearman",
+  exact = FALSE
+)
+
+moa_overall_r2 <- cor(
+  moa_cv_predictions$Predicted,
+  moa_cv_predictions$Observed,
+  use = "complete.obs"
+)^2
+
+# Report results
+cat("\n\n★ Leave-One-MOA-Out CV Summary ★\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat(sprintf("Completed folds: %d\n", nrow(moa_cv_metrics)))
+cat(sprintf("Total predicted samples: %d\n", nrow(moa_cv_predictions)))
+cat(sprintf("\n【Overall Performance】\n"))
+cat(sprintf("  Spearman ρ: %.3f (p = %.2e)\n", 
+            moa_overall_rho$estimate, moa_overall_rho$p.value))
+cat(sprintf("  R²: %.3f\n", moa_overall_r2))
+cat(sprintf("\n【Mean Fold Performance】\n"))
+cat(sprintf("  R²: %.3f ± %.3f\n", 
+            mean(moa_cv_metrics$R2, na.rm = TRUE), 
+            sd(moa_cv_metrics$R2, na.rm = TRUE)))
+
+# Identify MOA groups that are difficult to predict
+cat("\n【Performance by MOA】\n")
+moa_performance <- moa_cv_metrics %>%
+  arrange(R2) %>%
+  select(Target_Name, N_Test, R2, Spearman_rho)
+
+print(moa_performance)
+
+# Save results
+write.xlsx(
+  list(
+    "Summary" = data.frame(
+      Metric = c("Overall_Spearman_rho", "Overall_R2", "Mean_Fold_R2"),
+      Value = c(moa_overall_rho$estimate, moa_overall_r2, 
+                mean(moa_cv_metrics$R2, na.rm = TRUE))
+    ),
+    "Fold_Metrics" = moa_cv_metrics,
+    "MOA_Performance" = moa_performance,
+    "Predictions" = moa_cv_predictions
+  ),
+  file.path(data_dir,"Leave_One_MOA_Out_Results.xlsx"
+))
+
+cat("\n✓ Results saved: Leave_One_MOA_Out_Results.xlsx\n")
+```
+
+```{r}
+# ════════════════════════════════════════════════════════════
+# PART: Fully Nested Feature Selection
+# ════════════════════════════════════════════════════════════
+
+set.seed(123)
+N_OUTER <- 5
+
+outer_folds <- sample(rep(1:N_OUTER, length.out = nrow(X_clean)))
+
+fully_nested_results <- list()
+selected_proteins_per_fold <- list()
+
+for (k in 1:N_OUTER) {
+  cat(sprintf("\n═══ Outer Fold %d/%d ═══\n", k, N_OUTER))
+  
+  train_idx <- which(outer_folds != k)
+  test_idx <- which(outer_folds == k)
+  
+  X_train_fold <- X_clean[train_idx, ]
+  y_train_fold <- y_clean[train_idx]
+  
+  # ── Step 1: Recalculate partial correlations within the training set ──
+  partial_results_fold <- data.frame(
+    Protein = colnames(X_train_fold)[colnames(X_train_fold) != "Log10_Conc"],
+    Partial_p = NA_real_
+  )
+  
+  for (i in seq_len(nrow(partial_results_fold))) {
+    prot_name <- partial_results_fold$Protein[i]
+    pc <- partial_spearman(
+      X_train_fold[, prot_name],
+      y_train_fold,
+      X_train_fold[, "Log10_Conc"]
+    )
+    partial_results_fold$Partial_p[i] <- pc$p
+  }
+  
+  partial_results_fold$Partial_FDR <- p.adjust(
+    partial_results_fold$Partial_p, method = "BH"
+  )
+  
+  sig_proteins_fold <- partial_results_fold %>%
+    filter(Partial_FDR < 0.05) %>%
+    pull(Protein)
+  
+  cat(sprintf("  Significant proteins in fold %d: %d\n", k, length(sig_proteins_fold)))
+  
+  # ── Step 2: Elastic Net feature selection ──
+  X_train_sig <- X_train_fold[, c(sig_proteins_fold, "Log10_Conc")]
+  penalty_fold <- c(rep(1, length(sig_proteins_fold)), 0)
+  
+  cv_fold <- cv.glmnet(
+    X_train_sig, y_train_fold,
+    alpha = 0.5,
+    penalty.factor = penalty_fold
+  )
+  
+  coef_fold <- coef(cv_fold, s = "lambda.min")
+  elastic_selected_fold <- setdiff(
+    rownames(coef_fold)[coef_fold[, 1] != 0],
+    c("(Intercept)", "Log10_Conc")
+  )
+  
+  
+  # ── Step 4: Select the top N proteins (six proteins here) ──
+  # Rank proteins by absolute coefficient magnitude
+  protein_coefs_fold <- data.frame(
+    Protein = elastic_selected_fold,
+    Coefficient = sapply(elastic_selected_fold, function(p) coef_fold[p, 1])
+  ) %>%
+    mutate(Abs_Coef = abs(Coefficient)) %>%
+    arrange(desc(Abs_Coef)) %>%
+    slice_head(n = 6)
+  
+  selected_proteins_fold <- protein_coefs_fold$Protein
+  selected_proteins_per_fold[[k]] <- selected_proteins_fold
+  
+  cat(sprintf("  Selected proteins: %s\n", paste(selected_proteins_fold, collapse = ", ")))
+  
+  # ── Step 5: Predict on the test set ──
+  X_test_fold <- X_clean[test_idx, c(selected_proteins_fold, "Log10_Conc")]
+  X_train_final <- X_clean[train_idx, c(selected_proteins_fold, "Log10_Conc")]
+  
+  cv_final_fold <- cv.glmnet(
+    X_train_final, y_train_fold,
+    alpha = 0.5,
+    penalty.factor = c(rep(1, length(selected_proteins_fold)), 0)
+  )
+  
+  pred_fold <- predict(cv_final_fold, X_test_fold, s = "lambda.min")[, 1]
+  
+  fully_nested_results[[k]] <- data.frame(
+    Fold = k,
+    Compound = rownames(X_clean)[test_idx],
+    Observed = y_clean[test_idx],
+    Predicted = pred_fold
+  )
+}
+
+# ── Summarize results ──
+all_predictions <- do.call(rbind, fully_nested_results)
+
+fully_nested_r2 <- cor(all_predictions$Predicted, all_predictions$Observed)^2
+fully_nested_rho <- cor.test(
+  all_predictions$Predicted, all_predictions$Observed,
+  method = "spearman"
+)
+
+cat(sprintf(
+  "\n★ Fully Nested CV Performance:\n  R² = %.3f\n  Spearman ρ = %.3f (p = %.2e)\n",
+  fully_nested_r2, fully_nested_rho$estimate, fully_nested_rho$p.value
+))
+
+# ── Protein selection consistency ──
+all_selected <- unlist(selected_proteins_per_fold)
+protein_selection_freq <- table(all_selected) / N_OUTER * 100
+
+cat("\n★ Protein selection frequency across folds:\n")
+print(sort(protein_selection_freq, decreasing = TRUE))
+
+common_proteins <- names(protein_selection_freq)[protein_selection_freq == 100]
+cat(sprintf("\nProteins selected in ALL folds: %s\n", paste(common_proteins, collapse = ", ")))
+```
+
+
+```{r}
+# ═══════════════════════════════════════════════════════════════
+# Step 4: Comprehensive Performance Comparison
+# ═══════════════════════════════════════════════════════════════
+cat("\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("  Comprehensive Comparison: All Validation Strategies\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+
+library(ggplot2)
+library(patchwork)
+
+# Create comparison table
+comparison_table <- data.frame(
+  Method = c(
+    "Discovery CPS-6",
+    "Standard Nested CV",
+    "Fully Nested CV",
+    "Leave-One-API-Out",
+    "Leave-One-Cluster-Out",
+    "Leave-One-MOA-Out"
+  ),
+  Spearman_rho = c(
+    0.594,  #
+    mean(final_nested_r2)^0.5,  
+    0.334,  # 
+    api_overall_rho$estimate,
+    cluster_overall_rho$estimate,
+    moa_overall_rho$estimate
+  ),
+  R2 = c(
+    0.389,
+    mean(final_nested_r2),  
+    0.136,
+    api_overall_r2,
+    cluster_overall_r2,
+    moa_overall_r2
+  ),
+  N_Predictions = c(
+    nrow(modeling_data),
+    nrow(modeling_data),
+    nrow(all_predictions),  
+    nrow(api_cv_predictions),
+    nrow(cluster_cv_predictions),
+    nrow(moa_cv_predictions)
+  ),
+  stringsAsFactors = FALSE
+)
+
+print(comparison_table)
+
+# Visualize performance comparison
+p_comparison <- ggplot(
+  comparison_table,
+  aes(x = reorder(Method, Spearman_rho), y = Spearman_rho)
+) +
+  geom_col(aes(fill = Method), alpha = 0.8, width = 0.7, show.legend = FALSE) +
+  geom_hline(yintercept = c(0.3, 0.5), linetype = "dashed", color = "gray50") +
+  geom_text(aes(label = sprintf("%.3f", Spearman_rho)), 
+            hjust = -0.2, size = 3.5, fontface = "bold") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(limits = c(0, 0.7), expand = c(0, 0)) +
+  labs(
+    title = "CPS-6 Performance Across Validation Strategies",
+    subtitle = "Spearman correlation (higher = better)",
+    x = NULL,
+    y = "Spearman ρ"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.y = element_text(face = "bold")
+  )
+
+print(p_comparison)
+
+ggsave(file.path(fig_dir,"Validation_Methods_Comparison.pdf"), p_comparison, width = 10, height = 6)
+
+# Save comparison table
+write.xlsx(comparison_table, file.path(data_dir,"All_Validation_Methods_Comparison.xlsx"))
+#save.image("CPS6.RData")
+```

@@ -1,0 +1,86 @@
+name: drp-repro
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # Core runtimes
+  - python=3.10
+  - r-base=4.3.1
+  - r-rmarkdown
+  - r-knitr
+  - r-biocmanager
+
+  # Python analysis and plotting
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - statsmodels
+  - matplotlib
+  - seaborn
+  - umap-learn
+  - leidenalg
+  - python-igraph
+  - gseapy
+  - plotly
+  - tqdm
+  - openpyxl
+  - rdkit
+
+  # CRAN packages used by the R/Rmd workflows
+  - r-tidyverse
+  - r-readxl
+  - r-openxlsx
+  - r-fs
+  - r-matrixstats
+  - r-ggrepel
+  - r-plotly
+  - r-pheatmap
+  - r-vim
+  - r-rcolorbrewer
+  - r-ggforce
+  - r-patchwork
+  - r-corrplot
+  - r-scales
+  - r-reshape2
+  - r-ggalluvial
+  - r-writexl
+  - r-gridextra
+  - r-rcdk
+  - r-fingerprint
+  - r-factoextra
+  - r-itertools
+  - r-pvclust
+  - r-dendextend
+  - r-circlize
+  - r-here
+  - r-ggpubr
+  - r-drc
+  - r-glmnet
+  - r-randomforest
+  - r-proc
+  - r-data-table
+  - r-ggvenn
+  - r-venndiagram
+  - r-ggsignif
+  - r-rstatix
+  - r-ggridges
+  - r-wcorr
+  - r-igraph
+  - r-ggraph
+  - r-tidygraph
+  - r-upsetr
+  - r-progress
+  - r-stringr
+  - r-purrr
+
+  # Bioconductor packages used by pathway analysis and L1000 processing
+  - bioconductor-limma
+  - bioconductor-sva
+  - bioconductor-annotationdbi
+  - bioconductor-org.hs.eg.db
+  - bioconductor-clusterprofiler
+  - bioconductor-enrichplot
+  - bioconductor-fgsea
+  - bioconductor-cmapr=1.14.0

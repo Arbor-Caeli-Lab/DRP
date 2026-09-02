@@ -1,0 +1,2899 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-05-23"
+---
+
+#Step1: Regulatory events
+
+```{r setup, include=FALSE}
+source(file.path(knitr::current_input(dir = TRUE), "..", "_common", "repro_paths.R"))
+paths <- repro_paths("Code_chapter02")
+repo_root <- paths$repo_root
+input_dir <- paths$input_dir
+data_dir <- paths$results_dir
+fig_dir <- paths$results_dir
+folder_path <- input_dir
+
+load(file.path(input_dir, "Data processing and Quality assessment.RData"))
+
+library(readxl)
+library(dplyr)
+
+l2fc_mat <- as.matrix(final_l2fc_matrix_drugs_only)
+current_ids <- colnames(l2fc_mat)
+drug_annot <- read_excel(file.path(input_dir, "Drug info.xlsx"))
+
+n_protein <- nrow(l2fc_mat)
+n_drug    <- ncol(l2fc_mat)
+
+mapping <- drug_annot %>%
+    dplyr::select(ID, user_drug_name) %>%
+    distinct()
+
+new_names <- mapping$user_drug_name[match(current_ids, mapping$ID)]
+colnames(l2fc_mat) <- new_names
+colnames(final_l2fc_matrix_drugs_only) <- new_names
+l2fc_matrix<-l2fc_mat
+```
+
+
+```{r}
+# ===== Threshold definitions =====
+# Standard 1: 1.68-fold change (Log2FC > 0.75 or < -0.75)
+fc_threshold <- 0.75
+fold_change <- round(2^fc_threshold, 2)  # 1.68-fold
+
+# Standard 2: 3 standard deviations change
+sd_multiplier <- 3
+
+# Calculate standard deviation for each protein across all compounds
+protein_sd <- apply(l2fc_matrix, 1, sd, na.rm = TRUE)
+protein_mean <- apply(l2fc_matrix, 1, mean, na.rm = TRUE)
+
+# Create regulation event matrices
+regulation_matrix_fc <- abs(l2fc_matrix) > fc_threshold
+regulation_matrix_sd <- matrix(FALSE, nrow = nrow(l2fc_matrix), ncol = ncol(l2fc_matrix))
+
+for(i in 1:nrow(l2fc_matrix)) {
+  if(!is.na(protein_sd[i]) && protein_sd[i] > 0) {
+    regulation_matrix_sd[i, ] <- abs(l2fc_matrix[i, ] - protein_mean[i]) > (sd_multiplier * protein_sd[i])
+  }
+}
+
+# Combine two standards (satisfy either as regulation event)
+regulation_matrix_combined <- regulation_matrix_fc | regulation_matrix_sd
+
+# Statistical analysis
+cat("\n========== Proteome regulation statistics (FC>0.75, 3SD) ==========\n")
+cat(sprintf("Threshold settings: Log2FC > %.2f (%.2f-fold change) or %dSD\n", 
+            fc_threshold, fold_change, sd_multiplier))
+cat(sprintf("Total proteins: %d\n", nrow(l2fc_matrix)))
+cat(sprintf("Total compounds: %d\n", ncol(l2fc_matrix)))
+cat(sprintf("Total measurements: %d\n", length(l2fc_matrix)))
+
+# Count regulated proteins
+proteins_fc <- rowSums(regulation_matrix_fc, na.rm = TRUE) > 0
+proteins_sd <- rowSums(regulation_matrix_sd, na.rm = TRUE) > 0
+proteins_combined <- rowSums(regulation_matrix_combined, na.rm = TRUE) > 0
+
+cat(sprintf("\nProteins regulated by %.2f-fold change: %d (%.1f%%)\n", 
+            fold_change, sum(proteins_fc), sum(proteins_fc)/nrow(l2fc_matrix)*100))
+cat(sprintf("Proteins regulated by %dSD: %d (%.1f%%)\n", 
+            sd_multiplier, sum(proteins_sd), sum(proteins_sd)/nrow(l2fc_matrix)*100))
+cat(sprintf("Proteins regulated by either standard: %d (%.1f%%)\n", 
+            sum(proteins_combined), sum(proteins_combined)/nrow(l2fc_matrix)*100))
+
+# Count highly downregulated proteins
+highly_downreg <- rowSums(l2fc_matrix < -fc_threshold, na.rm = TRUE) > 0
+cat(sprintf("\nHighly downregulated proteins (L2FC < -%.2f): %d\n", fc_threshold, sum(highly_downreg)))
+
+# Count extremely downregulated proteins
+extremely_downreg <- rowSums(l2fc_matrix < -1, na.rm = TRUE) > 0
+cat(sprintf("Extremely downregulated proteins (L2FC < -1): %d\n", sum(extremely_downreg)))
+
+# Count total regulation events
+total_regulation_events <- sum(regulation_matrix_combined, na.rm = TRUE)
+cat(sprintf("\nTotal regulation events: %d (%.2f%% of all measurements)\n", 
+            total_regulation_events, 
+            total_regulation_events/length(l2fc_matrix)*100))
+
+# ===== Analysis of regulation event composition (FC / SD / both) =====
+only_fc_events <- sum(regulation_matrix_fc & !regulation_matrix_sd, na.rm = TRUE)
+only_sd_events <- sum(regulation_matrix_sd & !regulation_matrix_fc, na.rm = TRUE)
+both_events    <- sum(regulation_matrix_fc & regulation_matrix_sd, na.rm = TRUE)
+
+total_events_check <- only_fc_events + only_sd_events + both_events
+total_events_original <- total_regulation_events
+
+cat("\n========== Regulation event composition analysis ==========\n")
+cat(sprintf("Total regulation events (verification): %d (original: %d)\n", 
+            total_events_check, total_events_original))
+
+cat("\n--- Internal proportion of regulation events ---\n")
+cat(sprintf("Events regulated only by FC: %d (%.2f%% of regulation events)\n", 
+            only_fc_events, only_fc_events / total_events_original * 100))
+cat(sprintf("Events regulated only by SD: %d (%.2f%% of regulation events)\n", 
+            only_sd_events, only_sd_events / total_events_original * 100))
+cat(sprintf("Events regulated by both: %d (%.2f%% of regulation events)\n", 
+            both_events, both_events / total_events_original * 100))
+```
+ 
+ 
+```{r}
+library(VennDiagram)
+library(gridExtra)
+library(grid)
+library(ggvenn)
+library(patchwork)
+library(ggplot2)
+
+fc_upregulated <- rowSums(l2fc_matrix > fc_threshold, na.rm = TRUE) > 0
+fc_downregulated <- rowSums(l2fc_matrix < -fc_threshold, na.rm = TRUE) > 0
+
+# SD method - distinguish upregulation and downregulation
+regulation_matrix_sd_up <- matrix(FALSE, nrow = nrow(l2fc_matrix), ncol = ncol(l2fc_matrix))
+regulation_matrix_sd_down <- matrix(FALSE, nrow = nrow(l2fc_matrix), ncol = ncol(l2fc_matrix))
+
+for(i in 1:nrow(l2fc_matrix)) {
+  if(!is.na(protein_sd[i]) && protein_sd[i] > 0) {
+    # Upregulation: significantly higher than mean
+    regulation_matrix_sd_up[i, ] <- (l2fc_matrix[i, ] - protein_mean[i]) > (sd_multiplier * protein_sd[i])
+    # Downregulation: significantly lower than mean
+    regulation_matrix_sd_down[i, ] <- (l2fc_matrix[i, ] - protein_mean[i]) < -(sd_multiplier * protein_sd[i])
+  }
+}
+
+sd_upregulated <- rowSums(regulation_matrix_sd_up, na.rm = TRUE) > 0
+sd_downregulated <- rowSums(regulation_matrix_sd_down, na.rm = TRUE) > 0
+
+# ===== Statistical information =====
+cat("\n========== Upregulation/Downregulation protein statistics ==========\n")
+cat(sprintf("FC method upregulated proteins: %d (%.1f%%)\n", 
+            sum(fc_upregulated), sum(fc_upregulated)/nrow(l2fc_matrix)*100))
+cat(sprintf("FC method downregulated proteins: %d (%.1f%%)\n", 
+            sum(fc_downregulated), sum(fc_downregulated)/nrow(l2fc_matrix)*100))
+cat(sprintf("SD method upregulated proteins: %d (%.1f%%)\n", 
+            sum(sd_upregulated), sum(sd_upregulated)/nrow(l2fc_matrix)*100))
+cat(sprintf("SD method downregulated proteins: %d (%.1f%%)\n", 
+            sum(sd_downregulated), sum(sd_downregulated)/nrow(l2fc_matrix)*100))
+
+# Intersection statistics
+cat(sprintf("\nProteins identified by both methods as upregulated: %d\n", 
+            sum(fc_upregulated & sd_upregulated)))
+cat(sprintf("Proteins identified by both methods as downregulated: %d\n", 
+            sum(fc_downregulated & sd_downregulated)))
+
+# ===== Prepare data =====
+protein_names <- rownames(l2fc_matrix)
+
+venn_data_up <- list(
+  FC = protein_names[fc_upregulated],
+  SD = protein_names[sd_upregulated]
+)
+
+venn_data_down <- list(
+  FC = protein_names[fc_downregulated],
+  SD = protein_names[sd_downregulated]
+)
+
+# ===== Create upregulation Venn diagram =====
+p_up <- ggvenn(venn_data_up, 
+               fill_color = c("#E41A1C", "#377EB8"),
+               stroke_size = 1, 
+               set_name_size = 5,
+               text_size = 5) +
+  ggtitle("Upregulated Proteins") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+
+# ===== Create downregulation Venn diagram =====
+p_down <- ggvenn(venn_data_down, 
+                 fill_color = c("#4DAF4A", "#984EA3"),
+                 stroke_size = 1, 
+                 set_name_size = 5,
+                 text_size = 5) +
+  ggtitle("Downregulated Proteins") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+
+# ===== Combine using patchwork =====
+p_final <- p_up + p_down + 
+  plot_annotation(
+    title = 'Protein Regulation Comparison (FC vs SD Methods)',
+    theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+  )
+p_final
+
+# ===== Print statistics =====
+cat("\n========== Venn diagram statistics ==========\n")
+cat(sprintf("Upregulated proteins - FC only: %d\n", sum(fc_upregulated & !sd_upregulated)))
+cat(sprintf("Upregulated proteins - SD only: %d\n", sum(!fc_upregulated & sd_upregulated)))
+cat(sprintf("Upregulated proteins - both: %d\n", sum(fc_upregulated & sd_upregulated)))
+cat(sprintf("\nDownregulated proteins - FC only: %d\n", sum(fc_downregulated & !sd_downregulated)))
+cat(sprintf("Downregulated proteins - SD only: %d\n", sum(!fc_downregulated & sd_downregulated)))
+cat(sprintf("Downregulated proteins - both: %d\n", sum(fc_downregulated & sd_downregulated)))
+```
+
+```{r}
+library(VennDiagram)
+library(gridExtra)
+library(grid)
+
+# ===== Create upregulated proteins Venn diagram =====
+venn.up <- venn.diagram(
+  x = list(
+    FC = which(fc_upregulated),
+    SD = which(sd_upregulated)
+  ),
+  category.names = c(paste0("FC\n(", fold_change, "×)"), 
+                     paste0("SD\n(", sd_multiplier, "SD)")),
+  filename = NULL,
+  
+  # Color settings
+  fill = c("#E41A1C", "#377EB8"),
+  alpha = 0.5,
+  
+  # Border
+  lwd = 2,
+  col = c("#E41A1C", "#377EB8"),
+  
+  # Number size
+  cex = 1.8,
+  fontface = "bold",
+  
+  # Category names
+  cat.cex = 1.5,
+  cat.fontface = "bold",
+  cat.pos = c(-20, 20),
+  cat.dist = c(0.05, 0.05),
+  
+  # Subtitle
+  main = "Upregulated",
+  main.cex = 2,
+  main.fontface = "bold",
+  main.pos = c(0.5, 1.05)
+)
+
+# ===== Create downregulated proteins Venn diagram =====
+venn.down <- venn.diagram(
+  x = list(
+    FC = which(fc_downregulated),
+    SD = which(sd_downregulated)
+  ),
+  category.names = c(paste0("FC\n(", fold_change, "×)"), 
+                     paste0("SD\n(", sd_multiplier, "SD)")),
+  filename = NULL,
+  
+  # Color settings
+  fill = c("#4DAF4A", "#984EA3"),
+  alpha = 0.5,
+  
+  # Border
+  lwd = 2,
+  col = c("#4DAF4A", "#984EA3"),
+  
+  # Number size
+  cex = 1.8,
+  fontface = "bold",
+  
+  # Category names
+  cat.cex = 1.5,
+  cat.fontface = "bold",
+  cat.pos = c(-20, 20),
+  cat.dist = c(0.05, 0.05),
+  
+  # Subtitle
+  main = "Downregulated",
+  main.cex = 2,
+  main.fontface = "bold",
+  main.pos = c(0.5, 1.05)
+)
+output_pdf <- file.path(fig_dir, "02_Venn_comparison_horizontal.pdf")
+
+# ===== Export using PDF device =====
+pdf(output_pdf, width = 16, height = 8)
+
+# Combine plots using grid.arrange
+p_final <- grid.arrange(
+  gTree(children = venn.up), 
+  gTree(children = venn.down), 
+  ncol = 2,
+  top = textGrob("Protein Regulation Comparison (FC vs SD Methods)", 
+                 gp = gpar(fontsize = 20, fontface = "bold"))
+)
+
+grid.draw(p_final)
+dev.off()
+
+```
+
+#Step2: Frequently regulated proteins
+
+```{r}
+# --- 1. Load required packages ---
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(scales)
+
+# --- 2. Basic calculations ---
+upregulation_rate <- rowSums(l2fc_matrix > fc_threshold, na.rm = TRUE) / ncol(l2fc_matrix)
+downregulation_rate <- rowSums(l2fc_matrix < -fc_threshold, na.rm = TRUE) / ncol(l2fc_matrix)
+
+# --- 3. Build data frame ---
+no_response_threshold <- 0.05 
+
+protein_response_df <- data.frame(
+  Protein = rownames(l2fc_matrix),
+  UpRate = upregulation_rate,
+  DownRate = downregulation_rate,
+  TotalRate = upregulation_rate + downregulation_rate
+) %>%
+  mutate(
+    Direction = case_when(
+      TotalRate <= no_response_threshold ~ "Stable / Non-responsive",
+      UpRate > DownRate ~ "Preferentially Up",
+      DownRate > UpRate ~ "Preferentially Down",
+      TRUE ~ "Stable / Non-responsive"
+    )
+  )
+
+# --- 4. Select labels (Top 20) ---
+label_data <- protein_response_df %>%
+  filter(TotalRate > no_response_threshold) %>% 
+  arrange(desc(TotalRate)) %>% 
+  slice_head(n = 20)
+```
+
+#1.68-fold
+```{r}
+# --- 5. Plot (FC version) ---
+p_direction <- ggplot(protein_response_df, aes(x = DownRate, y = UpRate)) +
+  
+  geom_point(aes(color = Direction, alpha = Direction, size = Direction)) +
+  
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  
+  geom_text_repel(
+    data = label_data,
+    aes(label = Protein, color = Direction),
+    size = 3,
+    alpha = 1,
+    max.overlaps = 50,
+    box.padding = 0.6,
+    segment.size = 0.2,
+    show.legend = FALSE
+  ) +
+  
+  scale_color_manual(
+    name = "Response Pattern",
+    values = c("Preferentially Up" = "#CC79A7", 
+               "Preferentially Down" = "#0072B2", 
+               "Stable / Non-responsive" = "#D3D3D3")
+  ) +
+  
+  scale_alpha_manual(values = c("Preferentially Up" = 0.8, 
+                                "Preferentially Down" = 0.8, 
+                                "Stable / Non-responsive" = 0.15)) +
+  
+  scale_size_manual(values = c("Preferentially Up" = 2.5, 
+                               "Preferentially Down" = 2.5, 
+                               "Stable / Non-responsive" = 2.5)) +
+  
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  
+  labs(
+    title = "Protein Response Bias",
+    subtitle = sprintf("Frequency of significant regulation across all compounds (FC > %.2f)", fc_threshold),
+    x = "Frequency of Downregulation (% of Compounds)",
+    y = "Frequency of Upregulation (% of Compounds)"
+  ) +
+  
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(color = "gray40", hjust = 0.5, size = 10),
+    legend.position = "right",
+    aspect.ratio = 1
+  ) +
+  guides(alpha = "none", size = "none")
+
+print(p_direction)
+#ggsave(file.path(fig_dir,"03_p_direction_FC.pdf"), p_direction, width = 7, height = 7)
+#write.xlsx(protein_response_df, file.path(data_dir, "Plot01_frequent_protein_response_df_FC.xlsx"), rowNames = TRUE)
+```
+
+#3SD
+```{r}
+# --- SD version ---
+library(matrixStats)
+
+sd_limit <- 3  
+prot_means <- rowMeans(l2fc_matrix, na.rm = TRUE)
+prot_sds   <- rowSds(l2fc_matrix, na.rm = TRUE)
+z_score_matrix <- (l2fc_matrix - prot_means) / prot_sds
+
+up_rate <- rowSums(z_score_matrix > sd_limit, na.rm = TRUE) / ncol(l2fc_matrix)
+down_rate <- rowSums(z_score_matrix < -sd_limit, na.rm = TRUE) / ncol(l2fc_matrix)
+
+y_cutoff <- quantile(up_rate, 0.90, na.rm = TRUE)
+x_cutoff <- quantile(down_rate, 0.90, na.rm = TRUE)
+
+min_step <- 1 / ncol(l2fc_matrix)
+if (y_cutoff == 0) y_cutoff <- min_step
+if (x_cutoff == 0) x_cutoff <- min_step
+
+cat(sprintf("Defining significant threshold (Top 10%%): Up > %.2f%%, Down > %.2f%%\n", 
+            y_cutoff * 100, x_cutoff * 100))
+
+df_sd <- data.frame(
+    Protein = rownames(l2fc_matrix),
+    UpRate = up_rate,
+    DownRate = down_rate,
+    TotalRate = up_rate + down_rate
+) %>%
+    mutate(Direction = case_when(
+            UpRate < y_cutoff & DownRate < x_cutoff ~ "Stable / Non-responsive",
+            UpRate > DownRate ~ "Preferentially Up",
+            DownRate > UpRate ~ "Preferentially Down",
+            TRUE ~ "Stable / Non-responsive"))
+
+label_data_sd <- df_sd %>%
+    filter(Direction != "Stable")
+
+max_compounds <- max(rowSums(!is.na(l2fc_matrix)))
+step_est <- 1 / max_compounds 
+
+p_quantile_strict <- ggplot(df_sd, aes(x = DownRate, y = UpRate)) +
+    
+    geom_point(
+        aes(color = Direction, alpha = Direction, size = Direction),
+        position = position_jitter(width = step_est/2, height = step_est/2, seed = 42)
+    ) +
+    
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+    
+    geom_text_repel(
+        data = label_data_sd,
+        aes(label = Protein, color = Direction),
+        size = 3,
+        alpha = 1,
+        box.padding = 0.6,
+        max.overlaps = 30,
+        point.padding = 0.3,
+        show.legend = FALSE
+    ) +
+    
+    scale_color_manual(values = c("Preferentially Up" = "#CC79A7", 
+                                  "Preferentially Down" = "#0072B2", "Stable / Non-responsive" = "#D3D3D3")) +
+    
+    scale_alpha_manual(values = c("Preferentially Up" = 0.8, "Preferentially Down" = 0.8, "Stable / Non-responsive" = 0.15)) + 
+    
+    scale_size_manual(values = c("Preferentially Up" = 2.5, "Preferentially Down" = 2.5, "Stable / Non-responsive" = 2.5)) +
+    
+    scale_x_continuous(
+        labels = scales::percent_format(accuracy = 1),
+        limits = c(0, 0.05)
+    ) +
+    scale_y_continuous(
+        labels = scales::percent_format(accuracy = 1),
+        limits = c(0, 0.05)
+    ) +
+    
+    labs(title = "Frequent Responders (Top 10% Highlighted)",
+         subtitle = sprintf("Proteins below threshold (Up < %.1f%% & Down < %.1f%%) are shown in gray", 
+                            y_cutoff*100, x_cutoff*100),
+         x = "Frequency of Downregulation",
+         y = "Frequency of Upregulation") +
+    
+    theme_bw() +
+    theme(aspect.ratio = 1, panel.grid.minor = element_blank()) +
+    guides(alpha = "none", size = "none")
+
+print(p_quantile_strict)
+#ggsave(file.path(fig_dir,"03_p_direction_3SD.pdf"), p_quantile_strict, width = 7, height = 7)
+#write.xlsx(df_sd, file.path(data_dir, "Plot02_frequent_protein_response_df_SD.xlsx"), rowNames = TRUE)
+```
+# Overlap Heatmap
+
+```{r}
+library(dplyr)
+
+fc_res <- protein_response_df %>%
+    dplyr::select(Protein, Direction_FC = Direction, TotalRate_FC = TotalRate)
+
+sd_res <- df_sd %>%
+    dplyr::select(Protein, Direction_SD = Direction, TotalRate_SD = TotalRate)
+
+merged_comparison <- inner_join(fc_res, sd_res, by = "Protein")
+
+cross_table <- table(merged_comparison$Direction_FC, merged_comparison$Direction_SD)
+cross_df <- as.data.frame(cross_table)
+colnames(cross_df) <- c("FC_Method", "SD_Method", "Count")
+
+p_overlap <- ggplot(cross_df, aes(x = SD_Method, y = FC_Method)) +
+  geom_tile(aes(fill = log10(Count + 1)), color = "white") +
+  geom_text(aes(label = Count), color = "black", size = 4) +
+  scale_fill_gradient(low = "#eff3ff", high = "#2171b5", name = "Log10(Count)") +
+  labs(title = "Method Comparison: Fold Change vs. Z-score",
+       subtitle = "Number of proteins in each overlapping category",
+       x = "Classification by Z-score (SD > 3)",
+       y = "Classification by Fold Change (FC > 0.75)") +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+print(p_overlap)
+#write.xlsx(merged_comparison, file.path(data_dir, "Plot03_merged_comparison_FC_SD.xlsx"), rowNames = TRUE)
+```
+# Enrichment analysis
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db) 
+library(enrichplot)
+library(ggplot2)
+library(dplyr)
+
+# Extract gene lists
+list_fc_up <- rownames(protein_response_df)[protein_response_df$Direction == "Preferentially Up"]
+list_fc_down <- rownames(protein_response_df)[protein_response_df$Direction == "Preferentially Down"]
+list_sd_up <- rownames(df_sd)[df_sd$Direction == "Preferentially Up"]
+list_sd_down <- rownames(df_sd)[df_sd$Direction == "Preferentially Down"]
+
+background_proteins <- rownames(l2fc_matrix)
+
+# ID conversion
+convert_ids <- function(ids) {
+  tryCatch({
+    bitr(ids, 
+         fromType = "UNIPROT",
+         toType = c("ENTREZID", "SYMBOL"), 
+         OrgDb = org.Hs.eg.db)
+  }, error = function(e) { return(NULL) })
+}
+
+gene_clusters <- list(
+  "FC_Up" = convert_ids(list_fc_up)$ENTREZID,
+  "FC_Down" = convert_ids(list_fc_down)$ENTREZID,
+  "SD_Up" = convert_ids(list_sd_up)$ENTREZID,
+  "SD_Down" = convert_ids(list_sd_down)$ENTREZID
+)
+
+background_entrez <- convert_ids(background_proteins)$ENTREZID
+
+# KEGG enrichment
+comp_KEGG <- compareCluster(
+  geneCluster = gene_clusters, 
+  fun = "enrichKEGG",
+  universe      = background_entrez,
+  organism      = "hsa",
+  pAdjustMethod = "BH", 
+  pvalueCutoff  = 0.05
+)
+
+p_kegg <- dotplot(comp_KEGG, showCategory = 10) + 
+  ggtitle("KEGG Pathway Enrichment Comparison") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_kegg)
+
+# GO enrichment
+comp_GO <- compareCluster(
+  geneCluster = gene_clusters, 
+  fun = "enrichGO", 
+  universe      = background_entrez,
+  OrgDb         = org.Hs.eg.db,
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+p_go <- dotplot(comp_GO, showCategory = 10) + 
+  ggtitle("GO Enrichment Comparison: Biological Process") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_go)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(stringr)
+
+parse_ratio <- function(x) {
+  sapply(strsplit(x, "/"), function(z) as.numeric(z[1]) / as.numeric(z[2]))
+}
+
+plot_diverging_lollipop <- function(comp,
+                                    topn_each_dir = 10,
+                                    padj_cut = 0.05,
+                                    x_metric = c("GeneRatio", "minusLog10FDR"),
+                                    title = "Pathways regulated by drugs (Up vs Down)",
+                                    subtitle = NULL) {
+  x_metric <- match.arg(x_metric)
+
+  df <- as.data.frame(comp) %>%
+    filter(!is.na(Description), !is.na(p.adjust)) %>%
+    mutate(
+      Method = case_when(
+        grepl("^FC_", Cluster) ~ "FC threshold",
+        grepl("^SD_", Cluster) ~ "Z-score (3SD)",
+        TRUE ~ Cluster
+      ),
+      Direction = case_when(
+        grepl("_Up$", Cluster) ~ "Up",
+        grepl("_Down$", Cluster) ~ "Down",
+        TRUE ~ NA_character_
+      ),
+      GeneRatioNum = parse_ratio(GeneRatio),
+      minusLog10FDR = -log10(p.adjust + 1e-300),
+      Term = str_wrap(Description, 40)
+    ) %>%
+    filter(!is.na(Direction), p.adjust < padj_cut)
+
+  df_top <- df %>%
+    group_by(Method, Direction) %>%
+    slice_min(order_by = p.adjust, n = topn_each_dir, with_ties = FALSE) %>%
+    ungroup()
+
+  if (x_metric == "GeneRatio") {
+    df_top <- df_top %>% mutate(x = ifelse(Direction == "Up", GeneRatioNum, -GeneRatioNum))
+    xlab <- "GeneRatio (right = Up, left = Down)"
+    xscale <- scale_x_continuous(labels = percent_format(accuracy = 1))
+  } else {
+    df_top <- df_top %>% mutate(x = ifelse(Direction == "Up", minusLog10FDR, -minusLog10FDR))
+    xlab <- expression(-log[10]("FDR") ~ "(right = Up, left = Down)")
+    xscale <- scale_x_continuous()
+  }
+
+  term_order <- df_top %>%
+    group_by(Method, Term) %>%
+    summarise(score = max(abs(x)), .groups = "drop") %>%
+    arrange(Method, score)
+
+  df_top <- df_top %>%
+    left_join(term_order, by = c("Method","Term")) %>%
+    group_by(Method) %>%
+    mutate(Term_f = factor(Term, levels = unique(Term[order(score)]))) %>%
+    ungroup()
+
+  max_abs <- max(abs(df_top$x), na.rm = TRUE)
+
+  ggplot(df_top, aes(x = x, y = Term_f)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey55") +
+    geom_segment(aes(x = 0, xend = x, yend = Term_f),
+                 linewidth = 0.8, color = "grey85") +
+    geom_point(aes(size = Count, color = minusLog10FDR),
+               alpha = 0.95) +
+    facet_wrap(~Method, scales = "free_y", ncol = 2) +
+    xscale +
+    scale_color_viridis_c(option = "magma", name = expression(-log[10]*"(FDR)")) +
+    scale_size(range = c(2.5, 7), name = "Hit Count") +
+    coord_cartesian(xlim = c(-max_abs*1.08, max_abs*1.08)) +
+    labs(title = title, subtitle = subtitle, x = xlab, y = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      strip.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold"),
+      axis.text.y = element_text(size = 9)
+    )
+}
+
+p_kegg_div <- plot_diverging_lollipop(
+  comp_KEGG,
+  topn_each_dir = 10,
+  padj_cut = 0.05,
+  x_metric = "GeneRatio",
+  title = "KEGG: pathways up/down regulated across drugs",
+  subtitle = "Right = enriched in Up proteins; Left = enriched in Down proteins"
+)
+print(p_kegg_div)
+
+p_go_div <- plot_diverging_lollipop(
+  comp_GO,
+  topn_each_dir = 10,
+  padj_cut = 0.05,
+  x_metric = "GeneRatio",
+  title = "GO BP: processes up/down regulated across drugs",
+  subtitle = "Right = Up; Left = Down"
+)
+print(p_go_div)
+```
+
+# Step3:Compound activity analysis
+
+```{r}
+compound_activity <- data.frame(
+  Compound = colnames(l2fc_matrix),
+  N_Upregulated = colSums(l2fc_matrix > fc_threshold, na.rm = TRUE),
+  N_Downregulated = colSums(l2fc_matrix < -fc_threshold, na.rm = TRUE),
+  N_Regulated_SD = colSums(regulation_matrix_sd, na.rm = TRUE),
+  N_Total_Regulated = colSums(regulation_matrix_combined, na.rm = TRUE)
+)
+
+compound_activity <- compound_activity %>%
+  mutate(Total_FC = N_Upregulated + N_Downregulated) %>%
+  arrange(desc(N_Total_Regulated))
+
+cat("\n========== Compound activity statistics ==========\n")
+cat(sprintf("Median number of regulated proteins: %d\n", median(compound_activity$N_Total_Regulated)))
+cat(sprintf("Most active compound regulates: %d (%.1f%% of proteome)\n", 
+            max(compound_activity$N_Total_Regulated),
+            max(compound_activity$N_Total_Regulated)/nrow(l2fc_matrix)*100))
+
+cat("\nTop 5 most active compounds:\n")
+print(head(compound_activity, 5))
+
+compound_activity_plot <- compound_activity %>%
+  mutate(Compound = factor(Compound, levels = Compound)) %>%
+  slice_head(n = 50)
+
+p_waterfall <- ggplot(compound_activity_plot, 
+                      aes(x = 1:nrow(compound_activity_plot), y = N_Total_Regulated)) +
+  geom_col(fill = "#C7E0FB") +
+  geom_hline(yintercept = median(compound_activity$N_Total_Regulated), 
+             linetype = "dashed", color = "red", alpha = 0.5) +
+  annotate("text", x = 10, y = median(compound_activity$N_Total_Regulated) + 50,
+           label = paste("Median =", median(compound_activity$N_Total_Regulated)),
+           color = "red") +
+  labs(title = "Compound Activity Ranking",
+       subtitle = sprintf("Number of proteins regulated (%dSD or %.2f-fold)", 
+                         sd_multiplier, fold_change),
+       x = "Compound Rank",
+       y = "Number of Regulated Proteins") +
+  theme_bw()
+
+print(p_waterfall)
+```
+
+```{r}
+library(tidyr)
+
+fc_up_matrix   <- l2fc_matrix > fc_threshold
+fc_down_matrix <- l2fc_matrix < -fc_threshold
+
+sd_up_matrix <- regulation_matrix_sd & (l2fc_matrix > 0)
+sd_down_matrix <- regulation_matrix_sd & (l2fc_matrix < 0)
+
+combined_up_matrix <- fc_up_matrix | sd_up_matrix
+combined_down_matrix <- fc_down_matrix | sd_down_matrix
+
+compound_activity_directional <- data.frame(
+  Compound = colnames(l2fc_matrix),
+  N_Upregulated = colSums(combined_up_matrix, na.rm = TRUE),
+  N_Downregulated = colSums(combined_down_matrix, na.rm = TRUE)
+) %>%
+  mutate(N_Total_Regulated = N_Upregulated + N_Downregulated) %>%
+  arrange(desc(N_Total_Regulated))
+
+compound_activity_plot2 <- compound_activity_directional %>%
+  mutate(Rank = 1:n(), N_Downregulated = -N_Downregulated)
+
+plot_df <- compound_activity_plot2 %>%
+  pivot_longer(cols = c(N_Upregulated, N_Downregulated),
+               names_to = "Direction",
+               values_to = "Count")
+
+max_count <- max(
+  compound_activity_plot2$N_Upregulated,
+  abs(compound_activity_plot2$N_Downregulated)
+)
+
+p_waterfall_directional <- ggplot(plot_df, aes(x = Rank, y = Count, fill = Direction)) +
+    geom_col(width = 0.85) +
+    scale_fill_manual(
+        values = c(N_Upregulated = "#B8A0E3", N_Downregulated = "#A8C6E3"),
+        labels = c(N_Upregulated = "Upregulated", N_Downregulated = "Downregulated")
+    ) +
+    geom_hline(yintercept = 0, color = "black") +
+    geom_hline(yintercept = median(compound_activity_directional$N_Total_Regulated),
+               linetype = "dashed", color = "red", alpha = 0.5) +
+    geom_hline(yintercept = -median(compound_activity_directional$N_Total_Regulated),
+               linetype = "dashed", color = "red", alpha = 0.5) +
+    coord_cartesian(ylim = c(-max_count, max_count)) +
+    labs(
+        title = "Compound Activity Ranking",
+        subtitle = "Upregulated and Downregulated Proteins (FC + SD union)",
+        x = "Compound Rank",
+        y = "Number of Regulated Proteins"
+    ) + 
+    scale_x_continuous(
+        breaks = compound_activity_plot2$Rank,
+        labels = compound_activity_plot2$Compound
+    ) +
+    theme_bw() + 
+    theme(
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        legend.title = element_blank(),
+        panel.grid.major.x = element_blank()
+    ) + theme(aspect.ratio = 1)
+
+print(p_waterfall_directional)
+#ggsave(file.path(fig_dir,"04_p_waterfall_directional.pdf"), p_waterfall_directional, width = 14, height = 7)
+
+
+```
+
+
+```{r}
+compound_activity_sd <- data.frame(
+  Compound = colnames(l2fc_matrix),
+  N_Upregulated_SD = 0,
+  N_Downregulated_SD = 0
+)
+
+for(j in 1:ncol(l2fc_matrix)) {
+  up_count <- 0
+  down_count <- 0
+  for(i in 1:nrow(l2fc_matrix)) {
+    if(!is.na(protein_sd[i]) && protein_sd[i] > 0) {
+      if(l2fc_matrix[i,j] - protein_mean[i] > sd_multiplier * protein_sd[i]) {
+        up_count <- up_count + 1
+      }
+      if(l2fc_matrix[i,j] - protein_mean[i] < -sd_multiplier * protein_sd[i]) {
+        down_count <- down_count + 1
+      }
+    }
+  }
+  compound_activity_sd$N_Upregulated_SD[j] <- up_count
+  compound_activity_sd$N_Downregulated_SD[j] <- down_count
+}
+
+compound_activity_complete <- compound_activity %>%
+  left_join(compound_activity_sd, by = "Compound")
+
+cor_up <- cor(compound_activity_complete$N_Upregulated, 
+              compound_activity_complete$N_Upregulated_SD, 
+              method = "spearman")
+cor_down <- cor(compound_activity_complete$N_Downregulated, 
+                compound_activity_complete$N_Downregulated_SD, 
+                method = "spearman")
+
+top_fc <- compound_activity_complete %>%
+  mutate(Total_FC = N_Upregulated + N_Downregulated) %>%
+  arrange(desc(Total_FC)) %>%
+  slice_head(n = 15)
+
+top_sd <- compound_activity_complete %>%
+  mutate(Total_SD = N_Upregulated_SD + N_Downregulated_SD) %>%
+  arrange(desc(Total_SD)) %>%
+  slice_head(n = 15)
+
+p_fc_labeled <- ggplot(compound_activity_complete, 
+                       aes(x = N_Downregulated, y = N_Upregulated)) +
+  geom_point(alpha = 0.4, size = 2, color = "gray60") +
+  geom_point(data = top_fc, color = "#CC79A7", size = 3) +
+  geom_text_repel(data = top_fc, aes(label = Compound), 
+                  size = 3, color = "#CC79A7", max.overlaps = 20) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  labs(title = sprintf("%.2f-fold Change", fold_change),
+       subtitle = "Top 15 compounds labeled",
+       x = "Proteins Decreased",
+       y = "Proteins Increased") +
+  theme_bw() +
+  coord_fixed() + theme(aspect.ratio = 1)
+
+p_sd_labeled <- ggplot(compound_activity_complete, 
+                       aes(x = N_Downregulated_SD, y = N_Upregulated_SD)) +
+  geom_point(alpha = 0.4, size = 2, color = "gray60") +
+  geom_point(data = top_sd, color = "#0072B2", size = 3) +
+  geom_text_repel(data = top_sd, aes(label = Compound), 
+                  size = 3, color = "#0072B2", max.overlaps = 20) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  labs(title = sprintf("%d Standard Deviations", sd_multiplier),
+       subtitle = "Top 15 compounds labeled",
+       x = "Proteins Decreased",
+       y = "Proteins Increased") +
+  theme_bw() +
+  coord_fixed() + theme(aspect.ratio = 1)
+
+p_combined_labeled <- p_fc_labeled + p_sd_labeled +
+  plot_annotation(
+    title = "Compound Activity Balance: Direct Comparison",
+    theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5))
+  )
+
+print(p_combined_labeled)
+
+cat("\n========== FC vs SD comparison statistics ==========\n")
+cat(sprintf("\nFC standard (%.2f-fold):\n", fold_change))
+cat(sprintf("  Total events: %d\n", 
+            sum(compound_activity_complete$N_Upregulated + compound_activity_complete$N_Downregulated)))
+cat(sprintf("  Median - Up: %d, Down: %d\n",
+            median(compound_activity_complete$N_Upregulated),
+            median(compound_activity_complete$N_Downregulated)))
+cat(sprintf("  Maximum - Up: %d, Down: %d\n",
+            max(compound_activity_complete$N_Upregulated),
+            max(compound_activity_complete$N_Downregulated)))
+
+cat(sprintf("\nSD standard (%dSD):\n", sd_multiplier))
+cat(sprintf("  Total events: %d\n", 
+            sum(compound_activity_complete$N_Upregulated_SD + compound_activity_complete$N_Downregulated_SD)))
+cat(sprintf("  Median - Up: %d, Down: %d\n",
+            median(compound_activity_complete$N_Upregulated_SD),
+            median(compound_activity_complete$N_Downregulated_SD)))
+cat(sprintf("  Maximum - Up: %d, Down: %d\n",
+            max(compound_activity_complete$N_Upregulated_SD),
+            max(compound_activity_complete$N_Downregulated_SD)))
+
+cat(sprintf("\nCorrelation:\n"))
+cat(sprintf("  Upregulation event correlation: %.3f\n", cor_up))
+cat(sprintf("  Downregulation event correlation: %.3f\n", cor_down))
+
+#write.xlsx(compound_activity_complete, file.path(data_dir, "Plot04_compound_activity_ranking.xlsx"), rowNames = TRUE)
+#ggsave(file.path(fig_dir, "05_compound_balance_FC_vs_SD_enhanced.pdf"), p_combined_labeled, width = 14, height = 7)
+#save.image("Regulatory events.RData")
+```
+
+#Step4: API-variants
+
+```{r}
+library(openxlsx)
+final_l2fc_matrix_drugs_only<-read.xlsx(file.path(input_dir, "12_Final_L2FC_Matrix_Drugs_Only_367.xlsx"),rowNames = TRUE)
+drug_mapping <- read.xlsx(file.path(input_dir, "API_physicochemical variants_pairs.xlsx"))
+cat("Number of drugs in mapping table matching matrix columns:", nrow(drug_mapping), "\n")
+
+drug_cor_matrix <- cor(
+  final_l2fc_matrix_drugs_only,
+  method = "spearman",
+  use    = "pairwise.complete.obs")
+```
+
+```{r} 
+summary_list <- list() 
+delta_list   <- list()
+ingredients <- unique(drug_mapping$ActiveIngredient)
+
+for (ing in ingredients) {
+  sub_df <- drug_mapping %>% 
+    filter(ActiveIngredient == ing, ID %in% colnames(final_l2fc_matrix_drugs_only))
+  
+  if (nrow(sub_df) < 2) next
+  
+  combos <- combn(nrow(sub_df), 2)
+  
+  for (k in 1:ncol(combos)) {
+    idx1 <- combos[1, k]; idx2 <- combos[2, k]
+    id1 <- sub_df$ID[idx1]; id2 <- sub_df$ID[idx2]
+    type1 <- sub_df$FormType[idx1]; type2 <- sub_df$FormType[idx2]
+    
+    pair_type <- case_when(
+      type1 == "Core" & type2 == "Core" ~ "Core-Core",
+      type1 != "Core" & type2 != "Core" ~ "Variant-Variant",
+      TRUE ~ "Core-Variant"
+    )
+    
+    if (pair_type == "Core-Core") next 
+    
+    vec1 <- final_l2fc_matrix_drugs_only[, id1]
+    vec2 <- final_l2fc_matrix_drugs_only[, id2]
+    
+    abs_diff <- abs(vec1 - vec2)
+    abs_diff <- abs_diff[!is.na(abs_diff)]
+    if (length(abs_diff) == 0) next
+    
+    cor_val <- drug_cor_matrix[id1, id2]
+    
+    summary_list[[length(summary_list) + 1]] <- tibble(
+      ActiveIngredient = ing,
+      ID_1 = id1, Name_1 = sub_df$user_drug_name[idx1], Type_1 = type1,
+      ID_2 = id2, Name_2 = sub_df$user_drug_name[idx2], Type_2 = type2,
+      PairType      = pair_type,
+      Correlation   = cor_val,
+      MedianAbsDiff = median(abs_diff),
+      Pct_Gt_0_5    = mean(abs_diff > 0.5) * 100
+    )
+    
+    delta_list[[length(delta_list) + 1]] <- tibble(
+      AbsDiff = abs_diff,
+      Type    = pair_type
+    )
+  }
+}
+
+pair_summary_df <- bind_rows(summary_list)
+
+bio_reps <- tibble(AbsDiff = diff_data$Abs_Difference, Type = "Biological Replicates")
+variant_reps <- bind_rows(delta_list)
+
+plot_data_df <- bind_rows(bio_reps, variant_reps) %>%
+  mutate(Type = factor(Type, levels = c("Biological Replicates", "Core-Variant", "Variant-Variant")))
+
+cat("Total pairs analyzed:", nrow(pair_summary_df), "\n")
+print(table(plot_data_df$Type))
+```
+
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(ggsignif)
+library(dplyr)
+
+# Function to calculate Cohen's d
+calc_d <- function(v1, v2) {
+  if(length(v1) < 2 || length(v2) < 2) return(NA)
+  diff_mean <- mean(v1, na.rm=T) - mean(v2, na.rm=T)
+  pooled_sd <- sqrt(((length(v1)-1)*var(v1, na.rm=T) + (length(v2)-1)*var(v2, na.rm=T)) / (length(v1)+length(v2)-2))
+  return(diff_mean / pooled_sd)
+}
+
+# Extract group vectors
+vec_bio  <- plot_data_df$AbsDiff[plot_data_df$Type == "Biological Replicates"]
+vec_cv   <- plot_data_df$AbsDiff[plot_data_df$Type == "Core-Variant"]
+vec_vv   <- plot_data_df$AbsDiff[plot_data_df$Type == "Variant-Variant"]
+
+# Compute statistics
+stats_res <- list(
+  d_cv_bio = calc_d(vec_cv, vec_bio),
+  d_vv_cv  = calc_d(vec_vv, vec_cv),
+  d_vv_bio = calc_d(vec_vv, vec_bio),
+  p_cv_bio = wilcox.test(vec_cv, vec_bio)$p.value,
+  p_vv_cv  = wilcox.test(vec_vv, vec_cv)$p.value,
+  p_vv_bio = wilcox.test(vec_vv, vec_bio)$p.value
+)
+
+format_p <- function(p) if(p < 0.0001) "p < 0.0001" else sprintf("p = %.4f", p)
+
+anno_df <- tibble(
+  start = c("Biological Replicates", "Core-Variant", "Biological Replicates"),
+  end   = c("Core-Variant", "Variant-Variant", "Variant-Variant"),
+  y_pos = c(0.9, 1.05, 1.2), # Adjust Y-axis height based on your data range
+  label = c(
+    sprintf("d=%.2f\n%s", stats_res$d_cv_bio, format_p(stats_res$p_cv_bio)),
+    sprintf("d=%.2f\n%s", stats_res$d_vv_cv,  format_p(stats_res$p_vv_cv)),
+    sprintf("d=%.2f\n%s", stats_res$d_vv_bio, format_p(stats_res$p_vv_bio))
+  )
+)
+
+medians <- plot_data_df %>%
+  group_by(Type) %>%
+  summarise(MedianVal = median(AbsDiff, na.rm = TRUE))
+
+# 2. Plot
+p_final <- ggplot(plot_data_df, aes(x = Type, y = AbsDiff, fill = Type)) +
+  # Violin plot
+  geom_violin(trim = FALSE, alpha = 0.6, width = 0.7, color = NA) +
+  # Boxplot
+  geom_boxplot(width = 0.12, fill = "white", outlier.shape = NA, alpha = 0.9) +
+  geom_text(
+    data = medians, 
+    aes(x = Type, y = -0.05, label = sprintf("Med=%.3f", MedianVal)), 
+    size = 3.5, 
+    fontface = "bold", 
+    inherit.aes = FALSE # Must manually specify x
+  ) +
+  geom_signif(
+    data = anno_df,
+    aes(xmin = start, xmax = end, annotations = label, y_position = y_pos),
+    manual = TRUE, 
+    textsize = 3.2, 
+    vjust = 0.2, 
+    tip_length = 0.01, 
+    inherit.aes = FALSE
+  ) +
+  
+  scale_fill_manual(values = c("#374E55", "#DF8F44", "#00A1D5")) +
+  labs(
+    title = "Proteomic concordance between core and variant drug forms", 
+    subtitle = "Distribution of absolute protein log2FC differences\nwith Wilcoxon tests and Cohen's d effect sizes", 
+    x = NULL, 
+    y = "Absolute difference in protein log2 fold change (|Δlog2FC|)"
+  ) +
+ theme_bw()+
+  theme(
+    legend.position = "none", 
+    axis.text.x = element_text(face = "bold", color = "black"),
+    plot.title = element_text(face = "bold")
+  ) +
+  coord_cartesian(ylim = c(-0.1, 1.5))+theme(aspect.ratio = 1)
+
+print(p_final)
+
+#write.xlsx(plot_data_df, file.path(data_dir, "Plot05_plot_data_df.xlsx"), rowNames = TRUE)
+#ggsave(file.path(fig_dir,"06_CoreVariant_Delta_Distribution.pdf"),p_final, width = 7, height = 7)
+```
+
+
+```{r }
+plot_data_df <- plot_data_df %>% filter(AbsDiff <= 0.5)
+
+desired_order <- c("Biological Replicates", "Core-Variant", "Variant-Variant")
+plot_data_df$Type <- factor(plot_data_df$Type, levels = desired_order)
+set.seed(123)
+plot_data_df_std <- plot_data_df %>% filter(Type != "Variant-Variant")
+
+plot_data_df_dense_std <- plot_data_df_std %>% filter(AbsDiff <= 0.2) %>% 
+  group_by(Type) %>% slice_sample(prop = 0.005)
+
+plot_data_df_tail_std  <- plot_data_df_std %>% filter(AbsDiff > 0.2) %>% 
+  group_by(Type) %>% slice_sample(prop = 0.003)
+
+plot_data_df_vv <- plot_data_df %>% filter(Type == "Variant-Variant")
+
+plot_data_df_dense_vv <- plot_data_df_vv %>% filter(AbsDiff <= 0.2) %>% 
+  slice_sample(prop = 0.03)  
+plot_data_df_tail_vv  <- plot_data_df_vv %>% filter(AbsDiff > 0.2) %>% 
+  slice_sample(prop = 0.01)
+
+# Merge all sampled results as final scatter plot layer data
+plot_data_df_sampled <- bind_rows(plot_data_df_dense_std, plot_data_df_tail_std, plot_data_df_dense_vv, plot_data_df_tail_vv) %>% 
+  ungroup()
+
+print("After custom sampling, absolute sample counts per group used for scatter plot:")
+print(table(plot_data_df_sampled$Type))
+# ==========================================================================
+
+# Y-axis viewport configuration
+y_min <- -0.02
+y_max <- 0.7
+
+# Custom color palette
+my_rgb_colors <- c("#F09A9B", "#90B7E2", "#CC79A7") 
+
+
+p_final <- ggplot(plot_data_df, aes(x = Type, y = AbsDiff, color = Type)) +geom_violin(trim = TRUE, fill = NA, scale = "width", 
+              linewidth = 0.8, width = 0.6) +
+  geom_jitter(data = plot_data_df_sampled, 
+              width = 0.1, size = 0.6, alpha = 0.3, shape = 16, stroke = 0) + geom_boxplot(width = 0.12, fill = NA, color = "black", 
+               outlier.shape = NA, linewidth = 0.6) +  
+  scale_color_manual(values = my_rgb_colors) +
+  
+  labs(x = "Experimental Type", y = "Absolute Difference (AbsDiff)") +
+  coord_cartesian(ylim = c(y_min, y_max)) +
+  theme_bw() + 
+  theme(
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.6),
+    axis.text = element_text(color = "black", size = 10)
+  )
+
+p_final
+
+#ggsave(file.path(fig_dir,"06_CoreVariant_Delta_Distribution.pdf"),p_final, width = 7, height = 7)
+```
+
+
+```{r}
+library(dplyr)
+bio_cor_vals <- bio_replicates_cor_l2fc$Correlation_l2fc
+vec_bio <- plot_data_df$AbsDiff[plot_data_df$Type == "Biological Replicates"]
+
+q_cor_low   <- 0.15  
+q_diff_high <- 0.85 
+
+thr_cor_low   <- quantile(bio_cor_vals, probs = q_cor_low,   na.rm = TRUE)
+thr_diff_high <- quantile(vec_bio,      probs = q_diff_high, na.rm = TRUE)
+
+cat("Thresholds set based on biological replicate percentiles:\n")
+cat(sprintf("  Correlation lower bound: Cor > %.3f (at %.1f%% percentile)\n", thr_cor_low,   q_cor_low*100))
+cat(sprintf("  Difference upper bound: Diff < %.3f (at %.1f%% percentile)\n", thr_diff_high, q_diff_high*100))
+
+
+outlier_analysis_df <- pair_summary_df %>%
+    mutate(
+        Is_Low_Cor = Correlation < thr_cor_low,
+        Is_High_Diff = MedianAbsDiff > thr_diff_high,
+        
+        Category = case_when(
+            Is_Low_Cor & Is_High_Diff ~ "Potency Shift",     
+            Is_Low_Cor                ~ "Distinct / Outlier", 
+            Is_High_Diff              ~ "Potency Shift",  
+            TRUE                      ~ "Equivalent"
+        ),
+        
+        Label = ifelse(Category != "Equivalent",
+                       paste(Name_1, "vs", Name_2), NA_character_)
+    )
+
+cat("\nNumber of pairs per category:\n")
+print(table(outlier_analysis_df$Category))
+#write.xlsx(outlier_analysis_df,file.path(data_dir, "Plot06_outlier_analysis.xlsx"))
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tibble)
+library(ggrepel)
+
+
+p_outlier <- ggplot(outlier_analysis_df, aes(x = MedianAbsDiff, y = Correlation)) +
+    
+    annotate("rect", xmin = -Inf, xmax = thr_diff_high, ymin = thr_cor_low, ymax = Inf,
+             fill = "#e8d9f0", alpha = 0.13) +
+    annotate("rect", xmin = thr_diff_high, xmax = Inf, ymin = thr_cor_low, ymax = Inf,
+             fill = "#f4d4e6", alpha = 0.13) +
+    annotate("rect", xmin = -Inf, xmax = thr_diff_high, ymin = -Inf, ymax = thr_cor_low,
+             fill = "#d4c8e0", alpha = 0.13) +
+    annotate("rect", xmin = thr_diff_high, xmax = Inf, ymin = -Inf, ymax = thr_cor_low,
+             fill = "#b39cd9", alpha = 0.16) +
+    
+    geom_point(aes(color = Category, shape = PairType),
+               size = 3.5, alpha = 0.88, stroke = 0.65) +
+    
+    geom_hline(yintercept = thr_cor_low, linetype = "dashed",
+               color = "#6b4e9c", size = 0.95, alpha = 0.8) +
+    geom_vline(xintercept = thr_diff_high, linetype = "dashed",
+               color = "#8a5fa6", size = 0.95, alpha = 0.8) +
+    
+    geom_text_repel(aes(label = Label), size = 2.85, fontface = "bold",
+                    box.padding = 0.6, point.padding = 0.4,
+                    max.overlaps = 25,
+                    segment.color = "#9b7fc4",
+                    segment.size = 0.45, segment.alpha = 0.7,
+                    show.legend = FALSE) +
+    
+    scale_color_manual(
+        name = "Classification",
+        values = c("Equivalent" = "gray60",
+                   "Potency Shift" = "#CC79A7",
+                   "Distinct / Outlier" = "gray60"),
+        breaks = c("Equivalent", "Potency Shift")
+    ) +
+    
+    scale_shape_manual(name = "Pair Type", values = c(16, 17, 18)) +
+    scale_y_continuous(limits = c(-0.2, 1.05), breaks = seq(-0.2, 1.0, 0.2)) +
+    
+    labs(title = "Drug Pair Consistency Diagnostic Plot",
+         subtitle = paste0("Classification Thresholds: Correlation < ", round(thr_cor_low, 2),
+                           " and/or Median |ΔLog2FC| > ", round(thr_diff_high, 2)),
+         x = "Median Absolute Difference in Log2FC",
+         y = "Spearman Rank Correlation",
+         caption = "Light purple: Qualified | Pink purple: Potency shifts | Gray purple: Low correlation | Deep purple: Outliers") +
+    
+    theme_bw() +
+    theme(
+        legend.position = "top", 
+        legend.direction = "horizontal", 
+        legend.box = "horizontal",
+        legend.spacing.x = unit(0.35, "cm"), 
+        legend.key.size = unit(0.45, "cm"),
+        legend.text = element_text(size = 10.5, color = "#2c2a3a"),
+        legend.title = element_text(size = 11.5, face = "bold", color = "#2c2a3a"),
+        legend.background = element_rect(fill = "#f8f6fc", color = "#d8d0e6", size = 0.5),
+        legend.margin = margin(8, 8, 8, 8),
+        
+        plot.title = element_text(size = 15, face = "bold", color = "#2c2a3a", 
+                                  hjust = 0.5, margin = margin(b = 10)),
+        plot.subtitle = element_text(size = 10.5, color = "#6a5e8a", 
+                                     hjust = 0.5, margin = margin(b = 12), face = "italic"),
+        plot.caption = element_text(size = 9.5, color = "#8a7ea6", 
+                                    hjust = 0.5, margin = margin(t = 10)),
+        
+        axis.title = element_text(size = 12, face = "bold", color = "#2c2a3a"),
+        axis.text = element_text(size = 10, color = "#6a5e8a"),
+        axis.line = element_line(color = "#9b8ab8", size = 0.7),
+        axis.ticks = element_line(color = "#9b8ab8", size = 0.6),
+        
+        panel.grid.major = element_line(color = "#f0e9f7", size = 0.35),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "#7a5fa6", size = 0.85, fill = NA),
+        panel.background = element_rect(fill = "#ffffff", color = NA),
+        
+        aspect.ratio = 1,
+        plot.margin = margin(14, 14, 14, 14),
+        plot.background = element_rect(fill = "#ffffff", color = NA)
+    )
+p_outlier
+
+#ggsave(file.path(fig_dir, "07_outlier_diagnostic.pdf"), p_outlier, width = 10, height = 7,device = cairo_pdf)
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(fs)
+library(matrixStats)
+library(ggrepel)
+library(limma)
+library(plotly)
+library(pheatmap)
+library(VIM)
+library(sva)
+library(RColorBrewer)
+library(ggforce)
+library(patchwork)
+library(corrplot)
+library(scales)
+library(knitr)
+library(reshape2)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(openxlsx)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+
+direction_list <- list()
+
+for (i in seq_len(nrow(pair_summary_df))) {
+  row_i <- pair_summary_df[i, ]
+  
+  # Logic: ensure Core is baseline (denominator/control), Variant is comparator
+  # Assume we compare Variant vs Core
+  if (row_i$Type_1 == "Core") {
+    core_id <- row_i$ID_1
+    var_id  <- row_i$ID_2
+    var_name <- row_i$Name_2
+    var_type <- row_i$Type_2
+  } else if (row_i$Type_2 == "Core") {
+    core_id <- row_i$ID_2
+    var_id  <- row_i$ID_1
+    var_name <- row_i$Name_1
+    var_type <- row_i$Type_1
+  } else {
+    next # Skip if Variant vs Variant
+  }
+  
+  # Get expression vectors
+  vec_core <- final_l2fc_matrix_drugs_only[, core_id]
+  vec_var  <- final_l2fc_matrix_drugs_only[, var_id]
+  
+  # --- Compute key metrics ---
+  
+  # A. Potency/Magnitude: does variant induce stronger response?
+  # % of proteins where |Var| > |Core|
+  pct_stronger <- mean(abs(vec_var) > abs(vec_core), na.rm = TRUE) * 100
+  
+  # B. Bias: is variant signal globally higher?
+  # % of proteins where Var > Core
+  pct_positive_bias <- mean(vec_var > vec_core, na.rm = TRUE) * 100
+  
+  # Store result
+  direction_list[[length(direction_list) + 1]] <- tibble(
+    ActiveIngredient = row_i$ActiveIngredient,
+    VariantName = var_name,
+    VariantType = var_type,
+    Pct_Stronger = pct_stronger,       # >50% means Variant is more potent
+    Pct_Positive_Bias = pct_positive_bias # >50% means Variant has positive bias
+  )
+}
+
+# Combine into master table
+global_dir_df <- bind_rows(direction_list)
+
+# Add salt subtype column for downstream analysis
+global_dir_df <- global_dir_df %>%
+ mutate(
+    var_lower = tolower(VariantName),
+    
+    SaltSubtype = case_when(
+      # 1. Exclude non-salts (safety check)
+      !str_detect(tolower(VariantType), "salt") ~ NA_character_,
+      
+      # 2. Hydrochloride
+      str_detect(var_lower, "hydrochloride|\\bhcl\\b") ~ "Hydrochloride",
+      
+      # 3. Mesylate
+      str_detect(var_lower, "mesylate|methanesulfonate") ~ "Mesylate",
+      
+      # 4. Sodium
+      str_detect(var_lower, "sodium") ~ "Sodium",
+      
+      # 5. Tosylate
+      str_detect(var_lower, "tosylate") ~ "Tosylate",
+      
+      # 6. Phosphate
+      str_detect(var_lower, "phosphate") ~ "Phosphate",
+      
+      # 7. Organic Carboxylates (combined due to small N)
+      str_detect(var_lower, "maleate|malate|fumarate|succinate|citrate|tartrate") ~ "Organic Carboxylate",
+      
+      # 8. Other salts
+      TRUE ~ "Other Salts"
+    )
+  )
+
+print(head(global_dir_df))
+
+# ==============================================================================
+# 2. Global Analysis: Distribution across Variant Types (with statistics)
+# ==============================================================================
+# Rename VariantType for publication-ready labels
+
+# 2.1 Reshape to long format for plotting
+long_dir_df <- global_dir_df %>%
+  pivot_longer(cols = c(Pct_Stronger, Pct_Positive_Bias), 
+               names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric_Label = ifelse(Metric == "Pct_Stronger", 
+                               "Potency (|Var| > |Core|)", 
+                               "Global Bias (Var > Core)"))
+
+# 2.2 Statistical test: deviation from 50% (Wilcoxon one-sample test)
+one_sample_stats <- long_dir_df %>%
+  group_by(Metric, Metric_Label, VariantType) %>%
+  wilcox_test(Value ~ 1, mu = 50) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>%
+  mutate(y.position = 105) # Annotation position
+
+# 2.3 Plot: global boxplots
+p_global_stats <- ggplot(long_dir_df, aes(x = VariantType, y = Value, fill = VariantType)) +
+  # Reference line at 50%
+  geom_hline(yintercept = 50, linetype = "dashed", color = "red", size = 0.8) +
+  # Boxplot + jitter
+  geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.15, size = 1, alpha = 0.4) +
+  # Add significance markers
+  geom_text(data = one_sample_stats,
+            aes(x = VariantType, y = 102, label = p.adj.signif),
+            inherit.aes = FALSE, size = 5, color = "black") +
+  # Facet by metric
+  facet_wrap(~Metric_Label, scales = "free_y") +
+  scale_y_continuous(limits = c(0, 115), breaks = seq(0, 100, 25)) +
+  labs(
+    title = "Global directionality of core–variant perturbations",
+    subtitle = "Wilcoxon one-sample test against 50% (no directional bias)",
+    y = "Percentage of proteins (%)",
+    y = "Percentage (%)", x = NULL
+  ) +
+  theme_bw() +
+  theme(legend.position = "none", 
+        strip.background = element_rect(fill = "#EFEFEF"),
+        axis.text.x = element_text(face = "bold"))
+
+print(p_global_stats)
+```
+
+
+```{r}
+salt_analysis_df <- global_dir_df %>%
+filter(VariantType == "Salt")
+
+
+# 3.1 Prepare data: filter salts and remove groups with insufficient sample size
+salt_summary_stats <- salt_analysis_df %>%
+  group_by(SaltSubtype) %>%
+  summarise(
+    N = n(),
+    Mean_Potency = mean(Pct_Stronger, na.rm = TRUE),
+    SD_Potency = sd(Pct_Stronger, na.rm = TRUE),
+    Mean_Bias = mean(Pct_Positive_Bias, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 2: Statistical testing (only if N >= 3)
+salt_pvalues <- salt_analysis_df %>%
+  group_by(SaltSubtype) %>%
+  filter(n() >= 3) %>%
+  summarise(
+    p = tryCatch(
+      t.test(Pct_Stronger, mu = 50)$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p.adj = p.adjust(p, method = "fdr"),
+    p.adj.signif = case_when(
+      is.na(p.adj) ~ "",
+      p.adj < 0.001 ~ "***",
+      p.adj < 0.01 ~ "**",
+      p.adj < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  select(SaltSubtype, p.adj, p.adj.signif)
+
+# Step 3: Merge (do NOT filter N >= 2 — preserve all groups)
+salt_summary_stats <- salt_summary_stats %>%
+  left_join(salt_pvalues, by = "SaltSubtype") %>%
+  # filter(N >= 2) %>%  ← COMMENTED OUT TO PRESERVE ALL GROUPS
+  arrange(desc(Mean_Potency)) %>%
+  mutate(
+    # Set SD=0 for N=1 (hide error bars)
+    SD_Potency = replace_na(SD_Potency, 0),
+    p_label = replace_na(p.adj.signif, ""),
+    y_star_pos = Mean_Potency + SD_Potency + 3
+  )
+p_salt_fingerprint <- ggplot(salt_summary_stats, 
+                             aes(x = reorder(SaltSubtype, Mean_Potency), 
+                                 y = Mean_Potency)) +
+  # 50% reference line
+  geom_hline(yintercept = 50, linetype = "dashed", color = "grey50") +
+  
+  # Bar plot
+  geom_col(aes(fill = Mean_Bias), width = 0.7, color = "black", linewidth = 0.3) +
+  
+  # Error bars (only for N >= 2)
+  geom_errorbar(
+    data = subset(salt_summary_stats, N >= 2 & SD_Potency > 0),
+    aes(ymin = Mean_Potency - SD_Potency, 
+        ymax = Mean_Potency + SD_Potency),
+    width = 0.2, alpha = 0.6
+  ) +
+  
+  # Significance stars (only for testable groups)
+  geom_text(aes(y = y_star_pos, label = p_label),
+            size = 6, color = "black", vjust = 0) +
+  
+  # Sample size N annotation
+  geom_text(aes(label = paste0("n=", N), y = 35), 
+            size = 3.5, color = "grey30", fontface = "italic") +
+  
+  # Color gradient
+  scale_fill_gradient2(
+    low = "#ebd2d8", mid = "#dcc8e1", high = "#a57eb5", midpoint = 50,
+    name = "Signal Bias\n(% Var > Core)"
+  ) +
+  
+  # Adjust Y-axis to fit all data
+  scale_y_continuous(limits = c(0, 100), oob = scales::squish) +
+  
+  labs(
+    title = "Impact of salt form on proteomic potency",
+    subtitle = "Y-axis: potency (% proteins with |salt| > |free base|)",
+    x = "Salt subtype",
+    y = "% Proteins with |Variant| > |Core|"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank()
+  )+ theme(aspect.ratio = 1)
+
+print(p_salt_fingerprint)
+
+#write.xlsx(salt_summary_stats, file.path(data_dir, "Plot07_salt_summary_stats.xlsx"), rowNames = TRUE)
+#ggsave(file.path(fig_dir, "08_salt_fingerprint.pdf"), p_salt_fingerprint, width = 7, height = 7)
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(rstatix)
+
+comparison_df <- outlier_analysis_df %>%
+  filter(PairType == "Core-Variant") %>%
+  filter(Category %in% c("Equivalent", "Distinct / Outlier")) %>%
+  mutate(
+    VariantType = ifelse(Type_1 == "Core", Type_2, Type_1),
+    CoreID      = ifelse(Type_1 == "Core", ID_1, ID_2),
+    VariantID   = ifelse(Type_1 == "Core", ID_2, ID_1)
+  )
+
+# Compute directionality (Potency)
+comparison_df$Pct_Stronger <- NA_real_
+
+for (i in seq_len(nrow(comparison_df))) {
+  c_id <- comparison_df$CoreID[i]
+  v_id <- comparison_df$VariantID[i]
+  
+  if (c_id %in% colnames(final_l2fc_matrix_drugs_only) && 
+      v_id %in% colnames(final_l2fc_matrix_drugs_only)) {
+    
+    vec_c <- final_l2fc_matrix_drugs_only[, c_id]
+    vec_v <- final_l2fc_matrix_drugs_only[, v_id]
+    
+    # % |Var| > |Core|
+    comparison_df$Pct_Stronger[i] <- mean(abs(vec_v) > abs(vec_c), na.rm = TRUE) * 100
+  }
+}
+
+comparison_df <- comparison_df %>% drop_na(Pct_Stronger)
+
+
+comparison_df <- comparison_df %>%
+  mutate(VariantType = case_when(
+    VariantType %in% c("Salt", "Salt_Hydrate") ~ "Salt/Hydrate",
+    VariantType %in% c("Stereoisomer", "Geometric Isomer", "Isomer") ~ "Isomer",
+    VariantType %in% c("Prodrug", "Metabolite") ~ "Prodrug/Metabolite",
+    TRUE ~ "Other" # Solvate, Hydrate etc.
+  ))
+
+
+comparison_df$Category <- factor(comparison_df$Category, levels = c("Equivalent", "Distinct / Outlier"))
+
+cat("Final analysis sample size:", nrow(comparison_df), "\n")
+print(table(comparison_df$Category, comparison_df$VariantType))
+
+
+# Compute subgroup sample sizes
+subgroup_counts <- comparison_df %>%
+  group_by(Category, VariantType) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Perform T-tests (vs 50%) for subgroups with N>=3
+subgroup_stats <- comparison_df %>%
+  group_by(Category, VariantType) %>%
+  filter(n() >= 3) %>%
+  t_test(Pct_Stronger ~ 1, mu = 50) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>%
+  mutate(y.position = 105)
+
+cat("\n=== Subgroup Statistical Test Results ===\n")
+print(subgroup_stats)
+
+p_interaction <- ggplot(comparison_df, aes(x = VariantType, y = Pct_Stronger, fill = Category)) +
+geom_hline(yintercept = 50, linetype = "dashed", color = "grey50") +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.2), size = 2, alpha = 0.6) +
+  facet_grid(Category ~ ., scales = "fixed") +
+  geom_text(
+    data = subgroup_stats,
+    aes(x = VariantType, y = y.position, label = p.adj.signif),
+    size = 6, inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = subgroup_counts,
+    aes(x = VariantType, y = 5, label = paste0("n=", n)),
+    size = 3.5, color = "grey40", inherit.aes = FALSE
+  ) +
+   scale_fill_manual(values = c("Equivalent" = "#009E73", "Distinct / Outlier" = "#D55E00")) +
+  scale_y_continuous(limits = c(0, 115), breaks = seq(0, 100, 25)) +
+  
+  labs(
+    title = "Proteomic Directionality by Variant Type & Consistency",
+    subtitle = "Comparing systematic bias across variant types within each quality group",
+    y = "Potency (% Proteins with |Var| > |Core|)",
+    x = NULL
+  ) +
+  
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+print(p_interaction)
+
+#write.xlsx(comparison_df, file.path(data_dir, "Plot08_comparison_df.xlsx"), rowNames = TRUE)
+#ggsave(file.path(fig_dir, "09_p_Proteomic Directionality by Variant Type.pdf"), p_interaction, width = 7, height = 7)
+
+#save.image(file = "API_physicochemical variants_pairs.RData")
+```
+
+# Step5: GSEA Analysis Preparation
+
+```{r}
+library(dplyr)
+
+# 1.1 Read RDS
+msigdb_df <- readRDS(file.path(input_dir, "msigdb.2024.1.Hs.rds")) %>% as_tibble()
+
+names(msigdb_df)
+
+# 1.2 Keep only Hallmark gene sets (H collection) and ensure gene symbols exist
+hallmark_df <- msigdb_df %>%
+  filter(gs_collection == "H") %>%
+  filter(!is.na(db_gene_symbol))
+
+# 1.3 Convert to list format required by fgsea: names = pathway names, elements = gene vectors
+pathways_h <- hallmark_df %>%
+  group_by(gs_name) %>%
+  summarise(genes = list(unique(db_gene_symbol)), .groups = "drop") %>%
+  { setNames(.$genes, .$gs_name) }
+
+length(pathways_h)
+head(names(pathways_h))
+head(pathways_h[[1]])
+```
+
+# UniProt to Gene Symbol Mapping
+```{r}
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(dplyr)
+library(tidyr)
+uniprot_ids <- rownames(final_l2fc_matrix_drugs_only)
+head(uniprot_ids)
+map_df <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys    = uniprot_ids,
+  keytype = "UNIPROT",       # UniProt accession
+  columns = c("SYMBOL")      # Gene symbol
+) %>%
+  as_tibble() %>%
+  filter(!is.na(SYMBOL), SYMBOL != "")
+
+colnames(map_df) <- c("Uniprot", "GeneSymbol")
+head(map_df)
+length(unique(map_df$Uniprot))
+length(unique(map_df$GeneSymbol))
+length(uniprot_ids)
+length(intersect(uniprot_ids, map_df$Uniprot))
+# 2.1 Convert protein matrix to data.frame with Uniprot column
+l2fc_df <- final_l2fc_matrix_drugs_only %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Uniprot")
+
+gene_l2fc_df <- l2fc_df %>%
+  dplyr::inner_join(map_df, by = "Uniprot") %>%  # Must use dplyr::inner_join
+  dplyr::select(-Uniprot) %>%                    # Must use dplyr::select
+  dplyr::relocate(GeneSymbol)                   # Must use dplyr::relocate
+
+# Aggregate to gene level:
+gene_l2fc_df <- gene_l2fc_df %>%
+  dplyr::group_by(GeneSymbol) %>%
+  dplyr::summarise(
+    dplyr::across(where(is.numeric), ~ median(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+gene_l2fc_mat <- gene_l2fc_df %>%
+  tibble::column_to_rownames("GeneSymbol") %>%
+  as.matrix()
+
+dim(gene_l2fc_mat)
+head(rownames(gene_l2fc_mat))
+```
+
+
+```{r}
+library(fgsea)
+library(dplyr)
+
+run_delta_gsea_for_pair <- function(core_id, var_id, 
+                                    pair_meta, 
+                                    l2fc_mat, 
+                                    pathways, 
+                                    min_size = 15, 
+                                    max_size = 500, 
+                                    nperm    = 5000) {
+  if (!(core_id %in% colnames(l2fc_mat)) || !(var_id %in% colnames(l2fc_mat))) {
+    return(NULL)
+  }
+  
+  core_vec <- l2fc_mat[, core_id]
+  var_vec  <- l2fc_mat[, var_id]
+  delta    <- var_vec - core_vec
+  
+  valid_idx <- which(!is.na(delta))
+  stats_vec <- delta[valid_idx]
+  names(stats_vec) <- rownames(l2fc_mat)[valid_idx]
+  stats_vec <- sort(stats_vec, decreasing = TRUE)
+  
+  fg <- fgsea(
+    pathways = pathways,
+    stats    = stats_vec,
+    minSize  = min_size,
+    maxSize  = max_size,
+    nperm    = nperm
+  )
+  
+  if (nrow(fg) == 0) return(NULL)
+  
+  fg2 <- fg %>%
+    as_tibble() %>%
+    mutate(
+      CoreID        = core_id,
+      VariantID     = var_id,
+      ActiveIngredient = pair_meta$ActiveIngredient,
+      Category      = pair_meta$Category,
+      VariantForm   = pair_meta$VariantForm,
+      CoreName      = pair_meta$CoreName,
+      VariantName   = pair_meta$VariantName
+    )
+  
+  return(fg2)
+}
+```
+
+
+```{r}
+library(dplyr)
+library(fgsea)
+
+pairs_outlier <- outlier_analysis_df %>%
+  dplyr::filter(Category == "Potency Shift") %>%
+  dplyr::mutate(
+    CoreID      = ID_1,
+    VariantID   = ID_2,
+    CoreName    = Name_1,
+    VariantName = Name_2,
+    CoreType    = Type_1,
+    VariantForm = Type_2
+  ) %>%
+  dplyr::filter(!is.na(CoreID), !is.na(VariantID)) %>%
+  dplyr::filter(
+    CoreID %in% colnames(gene_l2fc_mat),
+    VariantID %in% colnames(gene_l2fc_mat)
+  )
+
+# Check data
+cat("Valid Distinct/Outlier pair count:", nrow(pairs_outlier), "\n")
+head(pairs_outlier)
+
+# Check how many pairs were filtered out
+n_total <- outlier_analysis_df %>% 
+  filter(Category == "Distinct / Outlier") %>% 
+  nrow()
+
+cat(sprintf("\nTotal pairs: %d\n", n_total))
+cat(sprintf("Valid pairs: %d\n", nrow(pairs_outlier)))
+cat(sprintf("Filtered out: %d (%.1f%%)\n", 
+            n_total - nrow(pairs_outlier),
+            100 * (n_total - nrow(pairs_outlier)) / n_total))
+
+# ===== 2. Improved GSEA function =====
+run_delta_gsea_for_pair <- function(core_id, var_id, 
+                                    pair_meta, 
+                                    l2fc_mat, 
+                                    pathways, 
+                                    min_size = 15, 
+                                    max_size = 500, 
+                                    nperm = 5000) {
+  
+  # Defensive checks
+  if (is.na(core_id) || is.na(var_id)) {
+    return(NULL)
+  }
+  
+  if (!(core_id %in% colnames(l2fc_mat)) || !(var_id %in% colnames(l2fc_mat))) {
+    warning(sprintf("Skipping: %s or %s not in matrix", core_id, var_id))
+    return(NULL)
+  }
+  
+  # Calculate delta
+  core_vec <- l2fc_mat[, core_id]
+  var_vec  <- l2fc_mat[, var_id]
+  delta    <- var_vec - core_vec
+  
+  # Filter valid values
+  valid_idx <- which(!is.na(delta) & is.finite(delta))
+  
+  if (length(valid_idx) < 100) {
+    warning(sprintf("Too few genes (%d) for %s vs %s", 
+                    length(valid_idx), core_id, var_id))
+    return(NULL)
+  }
+  
+  stats_vec <- delta[valid_idx]
+  names(stats_vec) <- rownames(l2fc_mat)[valid_idx]
+  stats_vec <- sort(stats_vec, decreasing = TRUE)
+  
+  # Run fgsea
+  tryCatch({
+    fg <- fgsea(
+      pathways = pathways,
+      stats    = stats_vec,
+      minSize  = min_size,
+      maxSize  = max_size,
+      nperm    = nperm
+    )
+    
+    if (nrow(fg) == 0) return(NULL)
+    
+    # Add metadata
+    fg2 <- fg %>%
+      as_tibble() %>%
+      mutate(
+        CoreID           = core_id,
+        VariantID        = var_id,
+        ActiveIngredient = pair_meta$ActiveIngredient,
+        Category         = pair_meta$Category,
+        CoreName         = pair_meta$CoreName,
+        VariantName      = pair_meta$VariantName,
+        CoreType         = pair_meta$CoreType,
+        VariantForm      = pair_meta$VariantForm,
+        Correlation      = pair_meta$Correlation,
+        MedianAbsDiff    = pair_meta$MedianAbsDiff
+      )
+    
+    return(fg2)
+    
+  }, error = function(e) {
+    warning(sprintf("GSEA failed for %s vs %s: %s", core_id, var_id, e$message))
+    return(NULL)
+  })
+}
+
+# ===== 3. Batch run GSEA (with progress bar) =====
+library(progress)
+
+gsea_list <- vector("list", nrow(pairs_outlier))
+
+pb <- progress_bar$new(
+  format = "  [:bar] :current/:total (:percent) eta: :eta",
+  total = nrow(pairs_outlier), 
+  clear = FALSE, 
+  width = 80
+)
+
+for (i in seq_len(nrow(pairs_outlier))) {
+  pb$tick()
+  
+  pm <- pairs_outlier[i, ]
+  
+  gsea_list[[i]] <- run_delta_gsea_for_pair(
+    core_id   = pm$CoreID,
+    var_id    = pm$VariantID,
+    pair_meta = pm,
+    l2fc_mat  = gene_l2fc_mat,
+    pathways  = pathways_h,
+    min_size  = 15,
+    max_size  = 500,
+    nperm     = 5000
+  )
+}
+
+# ===== 4. Combine results =====
+gsea_outlier_df <- bind_rows(gsea_list)
+
+# Output statistics
+cat("\n========== GSEA Analysis Results ==========\n")
+cat(sprintf("Successfully analyzed pairs: %d / %d\n", 
+            n_distinct(paste(gsea_outlier_df$CoreID, gsea_outlier_df$VariantID)),
+            nrow(pairs_outlier)))
+cat(sprintf("Total pathway detections: %d\n", nrow(gsea_outlier_df)))
+cat(sprintf("Significant pathways (FDR<0.05): %d\n", sum(gsea_outlier_df$padj < 0.05, na.rm = TRUE)))
+cat(sprintf("Highly significant pathways (FDR<0.01): %d\n", sum(gsea_outlier_df$padj < 0.01, na.rm = TRUE)))
+
+# View results
+head(gsea_outlier_df)
+```
+
+# Visualization Examples
+```{r Select one pair (e.g., Selinexor) for single-pair visualization}
+library(dplyr)
+library(ggplot2)
+# Example: select one pair of interest by ActiveIngredient (can change to specific CoreID/VariantID filter)
+one_pair <- gsea_outlier_df %>%
+  filter(ActiveIngredient == "Selinexor")  # or Selinexor/Crizotinib
+
+one_pair_sig <- one_pair %>%
+  filter(padj < 0.05) %>%
+  arrange(desc(abs(NES))) %>%
+  head(20) %>%
+  mutate(pathway = factor(pathway, levels = rev(pathway)))
+
+one_pair_sig_plot <- ggplot(one_pair_sig, aes(x = NES, y = pathway, fill = NES)) +
+  geom_col() +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B") +
+  geom_vline(xintercept = 0, color = "grey40") +
+  labs(
+    title = sprintf("Δ-GSEA (Variant vs Core): %s", unique(one_pair$ActiveIngredient)),
+    subtitle = sprintf("Core: %s   |   Variant: %s",
+                       unique(one_pair$CoreName), unique(one_pair$VariantName)),
+    x = "Normalized Enrichment Score (NES)\n(>0: Variant pathway overall↑, <0: Variant pathway overall↓)",
+    y = NULL
+  ) +
+  theme_bw(base_size = 12)
+
+one_pair_sig_plot
+```
+
+
+```{r}
+library(ggridges)
+library(tidyr)
+library(purrr)
+library(dplyr)
+library(stringr)
+extract_gene_deltas <- function(pathway_row, gene_l2fc_mat) {
+  
+  genes <- unlist(pathway_row$leadingEdge)
+
+  genes <- intersect(genes, rownames(gene_l2fc_mat))
+
+  if (length(genes) == 0) {
+    return(NULL)
+  }
+
+  core_vec <- gene_l2fc_mat[genes, pathway_row$CoreID]
+  var_vec  <- gene_l2fc_mat[genes, pathway_row$VariantID]
+
+  delta <- var_vec - core_vec
+
+  tibble(
+    pathway = pathway_row$pathway,
+    pathway_clean = pathway_row$pathway_clean,
+    gene = genes,
+    delta_l2fc = as.numeric(delta),
+    NES = pathway_row$NES
+  )
+}
+one_pair_sig <- one_pair %>%
+  filter(padj < 0.05) %>%
+  arrange(desc(abs(NES))) %>%
+  head(30) %>%  # Reduce to 15 pathways for display
+  mutate(
+    pathway_clean = str_replace(pathway, "^HALLMARK_", ""),
+    pathway_clean = str_replace_all(pathway_clean, "_", " "),
+    pathway_clean = str_to_title(pathway_clean)
+  )
+
+# ===== Batch extraction method (recommended) =====
+ridge_gene_data <- map_dfr(1:nrow(one_pair_sig), function(i) {
+  extract_gene_deltas(one_pair_sig[i, ], gene_l2fc_mat)
+})
+
+# Filter and order
+ridge_gene_data <- ridge_gene_data %>%
+  filter(!is.na(delta_l2fc), is.finite(delta_l2fc)) %>%
+  mutate(
+    pathway_clean = factor(pathway_clean,
+                           levels = unique(one_pair_sig$pathway_clean[order(one_pair_sig$NES)]))
+  )
+
+# Check data
+cat("Extracted gene data dimensions:", dim(ridge_gene_data), "\n")
+cat("Number of pathways involved:", n_distinct(ridge_gene_data$pathway), "\n")
+cat("Total genes:", nrow(ridge_gene_data), "\n")
+head(ridge_gene_data)
+
+# ===== Draw gene-level ridge plot =====
+gene_ridge_plot <- ggplot(ridge_gene_data, 
+                          aes(x = delta_l2fc, y = pathway_clean, fill = NES)) +
+  
+  # Ridge density + points
+  geom_density_ridges(
+    aes(point_color = NES, point_fill = NES),
+    alpha = 0.6,
+    scale = 2.5,
+    jittered_points = TRUE,
+    point_alpha = 0.4,
+    point_size = 1,
+    position = position_points_jitter(width = 0, height = 0)
+  ) +
+  
+  # Color scale
+  scale_fill_gradient2(
+    low = "#64A5D3",
+    mid = "white",
+    high = "#C3478F",
+    midpoint = 0,
+    name = "NES",
+    aesthetics = c("fill", "point_color", "point_fill")
+  ) +
+  
+  # Reference line
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.8) +
+  
+  # Title
+  labs(
+    title = sprintf("Gene-Level Delta Expression: %s", unique(one_pair$ActiveIngredient)),
+    subtitle = sprintf("%s vs %s | Leading Edge Genes",
+                       unique(one_pair$VariantName), unique(one_pair$CoreName)),
+    x = "Delta Log2FC (Variant - Core)",
+    y = NULL,
+    caption = "Each point = individual gene; Ridge = density distribution"
+  ) +
+  
+  # Theme
+  theme_ridges(font_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11, color = "grey40"),
+    plot.caption = element_text(size = 9, color = "grey50", hjust = 1),
+    axis.text.y = element_text(size = 9),
+    legend.position = "right"
+  )
+
+print(gene_ridge_plot)
+#View(ridge_gene_data)
+#write.xlsx(ridge_gene_data, file.path(data_dir, "Plot08_ridge_gene_data_R-Crizotinib_vs_S.xlsx"), rowNames = TRUE)
+#ggsave(file.path(fig_dir, "09_Ridgeline plot_R-Crizotinib_vs_S.pdf"), gene_ridge_plot,width = 7, height = 14)
+
+#write.xlsx(ridge_gene_data, file.path(data_dir, "Plot08_ridge_gene_data_Z-KPT330_VS_E-KPT330.xlsx"), rowNames = TRUE)
+#ggsave(file.path(fig_dir, "09_Ridgeline plot_Z-KPT330_VS_E-KPT330.pdf"), gene_ridge_plot,width = 7, height = 14)
+```
+
+
+```{r  Summary bar plot – number of significantly changed pathways per pair}
+pair_sig_counts <- gsea_outlier_df %>%
+  filter(padj < 0.05) %>%
+  group_by(CoreID, VariantID, CoreName, VariantName, ActiveIngredient) %>%
+  summarise(
+    N_sig_pathways = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(N_sig_pathways))
+
+pair_sig_counts
+
+ggplot(pair_sig_counts, aes(x = reorder(paste(CoreName, "vs", VariantName), N_sig_pathways),
+                            y = N_sig_pathways)) +
+  geom_col(fill = "#0072B2") +
+  coord_flip() +
+  labs(
+    title = "Number of significantly shifted pathways per distinct/outlier pair",
+    x = NULL,
+    y = "Number of Hallmark pathways with padj < 0.05 (Δ-GSEA)"
+  ) +
+  theme_bw(base_size = 12)
+#save.image(file = "Chapter 02.RData")
+```
+
+#API analysis
+
+```{r}
+load(file = file.path(input_dir, "Data processing and Quality assessment.RData"))
+drug_mapping <- read.xlsx(file.path(input_dir, "API_physicochemical variants_pairs.xlsx"))
+cat("Number of drugs in mapping table matching matrix columns:", nrow(drug_mapping), "\n")
+
+drug_cor_matrix <- cor(
+  final_l2fc_matrix_drugs_only,
+  method = "spearman",
+  use    = "pairwise.complete.obs")
+```
+
+# Step 1: Core–Variant Pairing Analysis
+
+```{r} 
+summary_list <- list() 
+delta_list   <- list()
+ingredients <- unique(drug_mapping$ActiveIngredient)
+
+for (ing in ingredients) {
+  # Filter current ingredient present in matrix
+  sub_df <- drug_mapping %>% 
+    filter(ActiveIngredient == ing, ID %in% colnames(final_l2fc_matrix_drugs_only))
+  
+  if (nrow(sub_df) < 2) next
+  
+  # Generate all pairwise combinations
+  combos <- combn(nrow(sub_df), 2)
+  
+  for (k in 1:ncol(combos)) {
+    idx1 <- combos[1, k]; idx2 <- combos[2, k]
+    id1 <- sub_df$ID[idx1]; id2 <- sub_df$ID[idx2]
+    type1 <- sub_df$FormType[idx1]; type2 <- sub_df$FormType[idx2]
+    
+    # Define pair type
+    pair_type <- case_when(
+      type1 == "Core" & type2 == "Core" ~ "Core-Core", # Rare
+      type1 != "Core" & type2 != "Core" ~ "Variant-Variant",
+      TRUE ~ "Core-Variant"
+    )
+    
+    if (pair_type == "Core-Core") next 
+    
+    # A. Extract data vectors
+    vec1 <- final_l2fc_matrix_drugs_only[, id1]
+    vec2 <- final_l2fc_matrix_drugs_only[, id2]
+    
+    # B. Compute absolute difference (Delta)
+    abs_diff <- abs(vec1 - vec2)
+    abs_diff <- abs_diff[!is.na(abs_diff)]
+    if (length(abs_diff) == 0) next
+    
+    # C. Fetch correlation from precomputed matrix
+    cor_val <- drug_cor_matrix[id1, id2]
+    
+    # --- Save Result 1: Summary Table (one row per drug pair) ---
+    summary_list[[length(summary_list) + 1]] <- tibble(
+      ActiveIngredient = ing,
+      ID_1 = id1, Name_1 = sub_df$user_drug_name[idx1], Type_1 = type1,
+      ID_2 = id2, Name_2 = sub_df$user_drug_name[idx2], Type_2 = type2,
+      PairType      = pair_type,
+      Correlation   = cor_val,
+      MedianAbsDiff = median(abs_diff),
+      Pct_Gt_0_5    = mean(abs_diff > 0.5) * 100
+    )
+    
+    # --- Save Result 2: Plotting Data (long format) ---
+    delta_list[[length(delta_list) + 1]] <- tibble(
+      AbsDiff = abs_diff,
+      Type    = pair_type
+    )
+  }
+}
+
+# Merge summary table (exportable to Excel)
+pair_summary_df <- bind_rows(summary_list)
+
+# Merge plotting data, include biological replicates (Baseline)
+# Assuming diff_data$Abs_Difference is the biological replicate difference vector
+bio_reps <- tibble(AbsDiff = diff_data$Abs_Difference, Type = "Biological Replicates")
+variant_reps <- bind_rows(delta_list)
+
+plot_data_df <- bind_rows(bio_reps, variant_reps) %>%
+  mutate(Type = factor(Type, levels = c("Biological Replicates", "Core-Variant", "Variant-Variant")))
+
+# Print basic info
+cat("Total pairs analyzed:", nrow(pair_summary_df), "\n")
+print(table(plot_data_df$Type))
+```
+
+# Step 2: Statistical Analysis & Visualization
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(ggsignif)
+library(dplyr)
+
+# Function to calculate Cohen's d
+calc_d <- function(v1, v2) {
+  if(length(v1) < 2 || length(v2) < 2) return(NA)
+  diff_mean <- mean(v1, na.rm=T) - mean(v2, na.rm=T)
+  pooled_sd <- sqrt(((length(v1)-1)*var(v1, na.rm=T) + (length(v2)-1)*var(v2, na.rm=T)) / (length(v1)+length(v2)-2))
+  return(diff_mean / pooled_sd)
+}
+
+# Extract group vectors
+vec_bio  <- plot_data_df$AbsDiff[plot_data_df$Type == "Biological Replicates"]
+vec_cv   <- plot_data_df$AbsDiff[plot_data_df$Type == "Core-Variant"]
+vec_vv   <- plot_data_df$AbsDiff[plot_data_df$Type == "Variant-Variant"]
+
+# Compute statistics
+stats_res <- list(
+  d_cv_bio = calc_d(vec_cv, vec_bio),
+  d_vv_cv  = calc_d(vec_vv, vec_cv),
+  d_vv_bio = calc_d(vec_vv, vec_bio),
+  p_cv_bio = wilcox.test(vec_cv, vec_bio)$p.value,
+  p_vv_cv  = wilcox.test(vec_vv, vec_cv)$p.value,
+  p_vv_bio = wilcox.test(vec_vv, vec_bio)$p.value
+)
+
+format_p <- function(p) if(p < 0.0001) "p < 0.0001" else sprintf("p = %.4f", p)
+
+anno_df <- tibble(
+  start = c("Biological Replicates", "Core-Variant", "Biological Replicates"),
+  end   = c("Core-Variant", "Variant-Variant", "Variant-Variant"),
+  y_pos = c(0.9, 1.05, 1.2), # Adjust Y-axis height based on your data range
+  label = c(
+    sprintf("d=%.2f\n%s", stats_res$d_cv_bio, format_p(stats_res$p_cv_bio)),
+    sprintf("d=%.2f\n%s", stats_res$d_vv_cv,  format_p(stats_res$p_vv_cv)),
+    sprintf("d=%.2f\n%s", stats_res$d_vv_bio, format_p(stats_res$p_vv_bio))
+  )
+)
+
+medians <- plot_data_df %>%
+  group_by(Type) %>%
+  summarise(MedianVal = median(AbsDiff, na.rm = TRUE))
+
+# 2. Plot
+p_final <- ggplot(plot_data_df, aes(x = Type, y = AbsDiff, fill = Type)) +
+  # Violin plot
+  geom_violin(trim = FALSE, alpha = 0.6, width = 0.7, color = NA) +
+  # Boxplot
+  geom_boxplot(width = 0.12, fill = "white", outlier.shape = NA, alpha = 0.9) +
+  geom_text(
+    data = medians, 
+    aes(x = Type, y = -0.05, label = sprintf("Med=%.3f", MedianVal)), 
+    size = 3.5, 
+    fontface = "bold", 
+    inherit.aes = FALSE # Must manually specify x
+  ) +
+  geom_signif(
+    data = anno_df,
+    aes(xmin = start, xmax = end, annotations = label, y_position = y_pos),
+    manual = TRUE, 
+    textsize = 3.2, 
+    vjust = 0.2, 
+    tip_length = 0.01, 
+    inherit.aes = FALSE
+  ) +
+  
+  scale_fill_manual(values = c("#374E55", "#DF8F44", "#00A1D5")) +
+  labs(
+    title = "Proteomic concordance between core and variant drug forms", 
+    subtitle = "Distribution of absolute protein log2FC differences\nwith Wilcoxon tests and Cohen's d effect sizes", 
+    x = NULL, 
+    y = "Absolute difference in protein log2 fold change (|Δlog2FC|)"
+  ) +
+ theme_bw()+
+  theme(
+    legend.position = "none", 
+    axis.text.x = element_text(face = "bold", color = "black"),
+    plot.title = element_text(face = "bold")
+  ) +
+  coord_cartesian(ylim = c(-0.1, 1.5))+theme(aspect.ratio = 1)
+
+print(p_final)
+
+#write.xlsx(plot_data_df, file.path(data_dir, "Plot01_plot_data_df.xlsx"), rowNames = TRUE)
+#ggsave(file.path(fig_dir,"01_CoreVariant_Delta_Distribution.pdf"),p_final, width = 7, height = 7)
+```
+
+```{r Plot}
+
+plot_data_df <- plot_data_df %>% filter(AbsDiff <= 0.5)
+
+
+desired_order <- c("Biological Replicates", "Core-Variant", "Variant-Variant")
+plot_data_df$Type <- factor(plot_data_df$Type, levels = desired_order)
+
+
+set.seed(123)
+
+
+plot_data_df_std <- plot_data_df %>% filter(Type != "Variant-Variant")
+
+plot_data_df_dense_std <- plot_data_df_std %>% filter(AbsDiff <= 0.2) %>% 
+  group_by(Type) %>% slice_sample(prop = 0.005)
+
+plot_data_df_tail_std  <- plot_data_df_std %>% filter(AbsDiff > 0.2) %>% 
+  group_by(Type) %>% slice_sample(prop = 0.003)
+
+
+plot_data_df_vv <- plot_data_df %>% filter(Type == "Variant-Variant")
+
+plot_data_df_dense_vv <- plot_data_df_vv %>% filter(AbsDiff <= 0.2) %>% 
+  slice_sample(prop = 0.03)  
+
+plot_data_df_tail_vv  <- plot_data_df_vv %>% filter(AbsDiff > 0.2) %>% 
+  slice_sample(prop = 0.01)  
+
+
+
+plot_data_df_sampled <- bind_rows(plot_data_df_dense_std, plot_data_df_tail_std, plot_data_df_dense_vv, plot_data_df_tail_vv) %>% 
+  ungroup()
+
+print(table(plot_data_df_sampled$Type))
+# ==========================================================================
+
+
+y_min <- -0.02
+y_max <- 0.7
+
+
+my_rgb_colors <- c("#F09A9B", "#90B7E2", "#CC79A7") 
+
+
+p_final <- ggplot(plot_data_df, aes(x = Type, y = AbsDiff, color = Type)) +
+
+  geom_violin(trim = TRUE, fill = NA, scale = "width", 
+              linewidth = 0.8, width = 0.6) +
+  
+
+  geom_jitter(data = plot_data_df_sampled, 
+              width = 0.1, size = 0.6, alpha = 0.3, shape = 16, stroke = 0) +
+  
+
+  geom_boxplot(width = 0.12, fill = NA, color = "black", 
+               outlier.shape = NA, linewidth = 0.6) +  
+  
+
+  scale_color_manual(values = my_rgb_colors) +
+  
+  labs(x = "Experimental Type", y = "Absolute Difference (AbsDiff)") +
+  coord_cartesian(ylim = c(y_min, y_max)) +
+  
+ 
+  theme_bw() + 
+  theme(
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    axis.ticks = element_line(color = "black", linewidth = 0.6),
+    axis.text = element_text(color = "black", size = 10)
+  )
+
+p_final
+
+#ggsave(file.path(fig_dir,"01_CoreVariant_Delta_Distribution.pdf"),p_final, width = 7, height = 7)
+```
+
+#Step 3: Outlier & Equivalent Classification
+
+```{r}
+library(dplyr)
+bio_cor_vals <- bio_replicates_cor_l2fc$Correlation_l2fc
+vec_bio <- plot_data_df$AbsDiff[plot_data_df$Type == "Biological Replicates"]
+
+q_cor_low   <- 0.17   # e.g., 5th percentile of correlation as "too low" threshold
+q_diff_high <- 0.83  # e.g., 95th percentile of difference as "too large" threshold
+
+
+thr_cor_low   <- quantile(bio_cor_vals, probs = q_cor_low,   na.rm = TRUE)
+thr_diff_high <- quantile(vec_bio,      probs = q_diff_high, na.rm = TRUE)
+
+cat("Thresholds set based on biological replicate percentiles:\n")
+cat(sprintf("  Correlation lower bound: Cor > %.3f (at %.1f%% percentile)\n", thr_cor_low,   q_cor_low*100))
+cat(sprintf("  Difference upper bound: Diff < %.3f (at %.1f%% percentile)\n", thr_diff_high, q_diff_high*100))
+
+
+outlier_analysis_df <- pair_summary_df %>%
+    mutate(
+        Is_Low_Cor = Correlation < thr_cor_low,
+        Is_High_Diff = MedianAbsDiff > thr_diff_high,
+        
+        Category = case_when(
+            Is_Low_Cor & Is_High_Diff ~ "Potency Shift",     
+            Is_Low_Cor                ~ "Distinct / Outlier", 
+            Is_High_Diff              ~ "Potency Shift",  
+            TRUE                      ~ "Equivalent"
+        ),
+        
+        Label = ifelse(Category != "Equivalent",
+                       paste(Name_1, "vs", Name_2), NA_character_)
+    )
+
+cat("\nNumber of pairs per category:\n")
+print(table(outlier_analysis_df$Category))
+#write.xlsx(outlier_analysis_df,file.path(data_dir, "01_outlier_analysis.xlsx"))
+```
+
+#Step 4: Scatter Plot Visualization
+
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tibble)
+library(ggrepel)
+
+p_outlier <- ggplot(outlier_analysis_df, aes(x = MedianAbsDiff, y = Correlation)) +
+    
+    annotate("rect", xmin = -Inf, xmax = thr_diff_high, ymin = thr_cor_low, ymax = Inf,
+             fill = "#e8d9f0", alpha = 0.13) +
+    annotate("rect", xmin = thr_diff_high, xmax = Inf, ymin = thr_cor_low, ymax = Inf,
+             fill = "#f4d4e6", alpha = 0.13) +
+    annotate("rect", xmin = -Inf, xmax = thr_diff_high, ymin = -Inf, ymax = thr_cor_low,
+             fill = "#d4c8e0", alpha = 0.13) +
+    annotate("rect", xmin = thr_diff_high, xmax = Inf, ymin = -Inf, ymax = thr_cor_low,
+             fill = "#b39cd9", alpha = 0.16) +
+    
+    geom_point(aes(color = Category, shape = PairType),
+               size = 3.5, alpha = 0.88, stroke = 0.65) +
+    
+    geom_hline(yintercept = thr_cor_low, linetype = "dashed",
+               color = "#6b4e9c", size = 0.95, alpha = 0.8) +
+    geom_vline(xintercept = thr_diff_high, linetype = "dashed",
+               color = "#8a5fa6", size = 0.95, alpha = 0.8) +
+    
+    geom_text_repel(aes(label = Label), size = 2.85, fontface = "bold",
+                    box.padding = 0.6, point.padding = 0.4,
+                    max.overlaps = 25,
+                    segment.color = "#9b7fc4",
+                    segment.size = 0.45, segment.alpha = 0.7,
+                    show.legend = FALSE) +
+    
+    scale_color_manual(
+        name = "Classification",
+        values = c("Equivalent" = "gray60",
+                   "Potency Shift" = "#CC79A7",
+                   "Distinct / Outlier" = "gray60"),
+        breaks = c("Equivalent", "Potency Shift")
+    ) +
+    
+    scale_shape_manual(name = "Pair Type", values = c(16, 17, 18)) +
+    scale_y_continuous(limits = c(-0.2, 1.05), breaks = seq(-0.2, 1.0, 0.2)) +
+    
+    labs(title = "Drug Pair Consistency Diagnostic Plot",
+         subtitle = paste0("Classification Thresholds: Correlation < ", round(thr_cor_low, 2),
+                           " and/or Median |ΔLog2FC| > ", round(thr_diff_high, 2)),
+         x = "Median Absolute Difference in Log2FC",
+         y = "Spearman Rank Correlation",
+         caption = "Light purple: Qualified | Pink purple: Potency shifts | Gray purple: Low correlation | Deep purple: Outliers") +
+    
+    theme_bw() +
+    theme(
+        legend.position = "top", 
+        legend.direction = "horizontal", 
+        legend.box = "horizontal",
+        legend.spacing.x = unit(0.35, "cm"), 
+        legend.key.size = unit(0.45, "cm"),
+        legend.text = element_text(size = 10.5, color = "#2c2a3a"),
+        legend.title = element_text(size = 11.5, face = "bold", color = "#2c2a3a"),
+        legend.background = element_rect(fill = "#f8f6fc", color = "#d8d0e6", size = 0.5),
+        legend.margin = margin(8, 8, 8, 8),
+        
+        plot.title = element_text(size = 15, face = "bold", color = "#2c2a3a", 
+                                  hjust = 0.5, margin = margin(b = 10)),
+        plot.subtitle = element_text(size = 10.5, color = "#6a5e8a", 
+                                     hjust = 0.5, margin = margin(b = 12), face = "italic"),
+        plot.caption = element_text(size = 9.5, color = "#8a7ea6", 
+                                    hjust = 0.5, margin = margin(t = 10)),
+        
+        axis.title = element_text(size = 12, face = "bold", color = "#2c2a3a"),
+        axis.text = element_text(size = 10, color = "#6a5e8a"),
+        axis.line = element_line(color = "#9b8ab8", size = 0.7),
+        axis.ticks = element_line(color = "#9b8ab8", size = 0.6),
+        
+        panel.grid.major = element_line(color = "#f0e9f7", size = 0.35),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "#7a5fa6", size = 0.85, fill = NA),
+        panel.background = element_rect(fill = "#ffffff", color = NA),
+        
+        aspect.ratio = 1,
+        plot.margin = margin(14, 14, 14, 14),
+        plot.background = element_rect(fill = "#ffffff", color = NA)
+    )
+p_outlier
+View(outlier_analysis_df)
+#ggsave(file.path(fig_dir, "02_outlier_diagnostic.pdf"), p_outlier, width = 10, height = 7,device = cairo_pdf)
+```
+
+# Step 5: Directionality & Salt Form Effect Analysis
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(fs)
+library(matrixStats)
+library(ggrepel)
+library(limma)
+library(plotly)
+library(pheatmap)
+library(VIM)
+library(sva)
+library(RColorBrewer)
+library(ggforce)
+library(patchwork)
+library(corrplot)
+library(scales)
+library(knitr)
+library(reshape2)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(openxlsx)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+
+direction_list <- list()
+
+for (i in seq_len(nrow(pair_summary_df))) {
+  row_i <- pair_summary_df[i, ]
+  
+  # Logic: ensure Core is baseline (denominator/control), Variant is comparator
+  # Assume we compare Variant vs Core
+  if (row_i$Type_1 == "Core") {
+    core_id <- row_i$ID_1
+    var_id  <- row_i$ID_2
+    var_name <- row_i$Name_2
+    var_type <- row_i$Type_2
+  } else if (row_i$Type_2 == "Core") {
+    core_id <- row_i$ID_2
+    var_id  <- row_i$ID_1
+    var_name <- row_i$Name_1
+    var_type <- row_i$Type_1
+  } else {
+    next # Skip if Variant vs Variant
+  }
+  
+  # Get expression vectors
+  vec_core <- final_l2fc_matrix_drugs_only[, core_id]
+  vec_var  <- final_l2fc_matrix_drugs_only[, var_id]
+  
+  # --- Compute key metrics ---
+  
+  # A. Potency/Magnitude: does variant induce stronger response?
+  # % of proteins where |Var| > |Core|
+  pct_stronger <- mean(abs(vec_var) > abs(vec_core), na.rm = TRUE) * 100
+  
+  # B. Bias: is variant signal globally higher?
+  # % of proteins where Var > Core
+  pct_positive_bias <- mean(vec_var > vec_core, na.rm = TRUE) * 100
+  
+  # Store result
+  direction_list[[length(direction_list) + 1]] <- tibble(
+    ActiveIngredient = row_i$ActiveIngredient,
+    VariantName = var_name,
+    VariantType = var_type,
+    Pct_Stronger = pct_stronger,       # >50% means Variant is more potent
+    Pct_Positive_Bias = pct_positive_bias # >50% means Variant has positive bias
+  )
+}
+
+# Combine into master table
+global_dir_df <- bind_rows(direction_list)
+
+# Add salt subtype column for downstream analysis
+global_dir_df <- global_dir_df %>%
+ mutate(
+    var_lower = tolower(VariantName),
+    
+    SaltSubtype = case_when(
+      # 1. Exclude non-salts (safety check)
+      !str_detect(tolower(VariantType), "salt") ~ NA_character_,
+      
+      # 2. Hydrochloride
+      str_detect(var_lower, "hydrochloride|\\bhcl\\b") ~ "Hydrochloride",
+      
+      # 3. Mesylate
+      str_detect(var_lower, "mesylate|methanesulfonate") ~ "Mesylate",
+      
+      # 4. Sodium
+      str_detect(var_lower, "sodium") ~ "Sodium",
+      
+      # 5. Tosylate
+      str_detect(var_lower, "tosylate") ~ "Tosylate",
+      
+      # 6. Phosphate
+      str_detect(var_lower, "phosphate") ~ "Phosphate",
+      
+      # 7. Organic Carboxylates (combined due to small N)
+      str_detect(var_lower, "maleate|malate|fumarate|succinate|citrate|tartrate") ~ "Organic Carboxylate",
+      
+      # 8. Other salts
+      TRUE ~ "Other Salts"
+    )
+  )
+
+print(head(global_dir_df))
+
+# ==============================================================================
+# 2. Global Analysis: Distribution across Variant Types (with statistics)
+# ==============================================================================
+# Rename VariantType for publication-ready labels
+
+# 2.1 Reshape to long format for plotting
+long_dir_df <- global_dir_df %>%
+  pivot_longer(cols = c(Pct_Stronger, Pct_Positive_Bias), 
+               names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric_Label = ifelse(Metric == "Pct_Stronger", 
+                               "Potency (|Var| > |Core|)", 
+                               "Global Bias (Var > Core)"))
+
+# 2.2 Statistical test: deviation from 50% (Wilcoxon one-sample test)
+one_sample_stats <- long_dir_df %>%
+  group_by(Metric, Metric_Label, VariantType) %>%
+  wilcox_test(Value ~ 1, mu = 50) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>%
+  mutate(y.position = 105) # Annotation position
+
+# 2.3 Plot: global boxplots
+p_global_stats <- ggplot(long_dir_df, aes(x = VariantType, y = Value, fill = VariantType)) +
+  # Reference line at 50%
+  geom_hline(yintercept = 50, linetype = "dashed", color = "red", size = 0.8) +
+  # Boxplot + jitter
+  geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.15, size = 1, alpha = 0.4) +
+  # Add significance markers
+  geom_text(data = one_sample_stats,
+            aes(x = VariantType, y = 102, label = p.adj.signif),
+            inherit.aes = FALSE, size = 5, color = "black") +
+  # Facet by metric
+  facet_wrap(~Metric_Label, scales = "free_y") +
+  scale_y_continuous(limits = c(0, 115), breaks = seq(0, 100, 25)) +
+  labs(
+    title = "Global directionality of core–variant perturbations",
+    subtitle = "Wilcoxon one-sample test against 50% (no directional bias)",
+    y = "Percentage of proteins (%)",
+    y = "Percentage (%)", x = NULL
+  ) +
+  theme_bw() +
+  theme(legend.position = "none", 
+        strip.background = element_rect(fill = "#EFEFEF"),
+        axis.text.x = element_text(face = "bold"))
+
+print(p_global_stats)
+```
+
+# Step 6: Salt Subtype Analysis
+
+```{r}
+salt_analysis_df <- global_dir_df %>%
+filter(VariantType == "Salt")
+
+
+# 3.1 Prepare data: filter salts and remove groups with insufficient sample size
+salt_summary_stats <- salt_analysis_df %>%
+  group_by(SaltSubtype) %>%
+  summarise(
+    N = n(),
+    Mean_Potency = mean(Pct_Stronger, na.rm = TRUE),
+    SD_Potency = sd(Pct_Stronger, na.rm = TRUE),
+    Mean_Bias = mean(Pct_Positive_Bias, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 2: Statistical testing (only if N >= 3)
+salt_pvalues <- salt_analysis_df %>%
+  group_by(SaltSubtype) %>%
+  filter(n() >= 3) %>%
+  summarise(
+    p = tryCatch(
+      t.test(Pct_Stronger, mu = 50)$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p.adj = p.adjust(p, method = "fdr"),
+    p.adj.signif = case_when(
+      is.na(p.adj) ~ "",
+      p.adj < 0.001 ~ "***",
+      p.adj < 0.01 ~ "**",
+      p.adj < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  select(SaltSubtype, p.adj, p.adj.signif)
+
+# Step 3: Merge (do NOT filter N >= 2 — preserve all groups)
+salt_summary_stats <- salt_summary_stats %>%
+  left_join(salt_pvalues, by = "SaltSubtype") %>%
+  # filter(N >= 2) %>%  ← COMMENTED OUT TO PRESERVE ALL GROUPS
+  arrange(desc(Mean_Potency)) %>%
+  mutate(
+    # Set SD=0 for N=1 (hide error bars)
+    SD_Potency = replace_na(SD_Potency, 0),
+    p_label = replace_na(p.adj.signif, ""),
+    y_star_pos = Mean_Potency + SD_Potency + 3
+  )
+p_salt_fingerprint <- ggplot(salt_summary_stats, 
+                             aes(x = reorder(SaltSubtype, Mean_Potency), 
+                                 y = Mean_Potency)) +
+  # 50% reference line
+  geom_hline(yintercept = 50, linetype = "dashed", color = "grey50") +
+  
+  # Bar plot
+  geom_col(aes(fill = Mean_Bias), width = 0.7, color = "black", linewidth = 0.3) +
+  
+  # Error bars (only for N >= 2)
+  geom_errorbar(
+    data = subset(salt_summary_stats, N >= 2 & SD_Potency > 0),
+    aes(ymin = Mean_Potency - SD_Potency, 
+        ymax = Mean_Potency + SD_Potency),
+    width = 0.2, alpha = 0.6
+  ) +
+  
+  # Significance stars (only for testable groups)
+  geom_text(aes(y = y_star_pos, label = p_label),
+            size = 6, color = "black", vjust = 0) +
+  
+  # Sample size N annotation
+  geom_text(aes(label = paste0("n=", N), y = 35), 
+            size = 3.5, color = "grey30", fontface = "italic") +
+  
+  # Color gradient
+  scale_fill_gradient2(
+    low = "#ebd2d8", mid = "#dcc8e1", high = "#a57eb5", midpoint = 50,
+    name = "Signal Bias\n(% Var > Core)"
+  ) +
+  
+  # Adjust Y-axis to fit all data
+  scale_y_continuous(limits = c(0, 100), oob = scales::squish) +
+  
+  labs(
+    title = "Impact of salt form on proteomic potency",
+    subtitle = "Y-axis: potency (% proteins with |salt| > |free base|)",
+    x = "Salt subtype",
+    y = "% Proteins with |Variant| > |Core|"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank()
+  )+ theme(aspect.ratio = 1)
+
+print(p_salt_fingerprint)
+
+#write.xlsx(salt_summary_stats, file.path(data_dir, "Plot02_salt_summary_stats.xlsx"), rowNames = TRUE)
+#ggsave(file.path(fig_dir, "03_salt_fingerprint.pdf"), p_salt_fingerprint, width = 7, height = 7)
+```
+
+# Step 7: Assessment by Drug Similarity
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(rstatix)
+
+comparison_df <- outlier_analysis_df %>%
+  filter(PairType == "Core-Variant") %>%
+  filter(Category %in% c("Equivalent", "Distinct / Outlier")) %>%
+  mutate(
+    VariantType = ifelse(Type_1 == "Core", Type_2, Type_1),
+    CoreID      = ifelse(Type_1 == "Core", ID_1, ID_2),
+    VariantID   = ifelse(Type_1 == "Core", ID_2, ID_1)
+  )
+
+# Compute directionality (Potency)
+comparison_df$Pct_Stronger <- NA_real_
+
+for (i in seq_len(nrow(comparison_df))) {
+  c_id <- comparison_df$CoreID[i]
+  v_id <- comparison_df$VariantID[i]
+  
+  if (c_id %in% colnames(final_l2fc_matrix_drugs_only) && 
+      v_id %in% colnames(final_l2fc_matrix_drugs_only)) {
+    
+    vec_c <- final_l2fc_matrix_drugs_only[, c_id]
+    vec_v <- final_l2fc_matrix_drugs_only[, v_id]
+    
+    # % |Var| > |Core|
+    comparison_df$Pct_Stronger[i] <- mean(abs(vec_v) > abs(vec_c), na.rm = TRUE) * 100
+  }
+}
+
+comparison_df <- comparison_df %>% drop_na(Pct_Stronger)
+
+
+comparison_df <- comparison_df %>%
+  mutate(VariantType = case_when(
+    VariantType %in% c("Salt", "Salt_Hydrate") ~ "Salt/Hydrate",
+    VariantType %in% c("Stereoisomer", "Geometric Isomer", "Isomer") ~ "Isomer",
+    VariantType %in% c("Prodrug", "Metabolite") ~ "Prodrug/Metabolite",
+    TRUE ~ "Other" # Solvate, Hydrate etc.
+  ))
+
+
+comparison_df$Category <- factor(comparison_df$Category, levels = c("Equivalent", "Distinct / Outlier"))
+
+cat("Final analysis sample size:", nrow(comparison_df), "\n")
+print(table(comparison_df$Category, comparison_df$VariantType))
+
+
+# Compute subgroup sample sizes
+subgroup_counts <- comparison_df %>%
+  group_by(Category, VariantType) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Perform T-tests (vs 50%) for subgroups with N>=3
+subgroup_stats <- comparison_df %>%
+  group_by(Category, VariantType) %>%
+  filter(n() >= 3) %>%
+  t_test(Pct_Stronger ~ 1, mu = 50) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>%
+  mutate(y.position = 105)
+
+cat("\n=== Subgroup Statistical Test Results ===\n")
+print(subgroup_stats)
+
+p_interaction <- ggplot(comparison_df, aes(x = VariantType, y = Pct_Stronger, fill = Category)) +
+geom_hline(yintercept = 50, linetype = "dashed", color = "grey50") +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.2), size = 2, alpha = 0.6) +
+  facet_grid(Category ~ ., scales = "fixed") +
+  geom_text(
+    data = subgroup_stats,
+    aes(x = VariantType, y = y.position, label = p.adj.signif),
+    size = 6, inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = subgroup_counts,
+    aes(x = VariantType, y = 5, label = paste0("n=", n)),
+    size = 3.5, color = "grey40", inherit.aes = FALSE
+  ) +
+   scale_fill_manual(values = c("Equivalent" = "#009E73", "Distinct / Outlier" = "#D55E00")) +
+  scale_y_continuous(limits = c(0, 115), breaks = seq(0, 100, 25)) +
+  
+  labs(
+    title = "Proteomic Directionality by Variant Type & Consistency",
+    subtitle = "Comparing systematic bias across variant types within each quality group",
+    y = "Potency (% Proteins with |Var| > |Core|)",
+    x = NULL
+  ) +
+  
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+print(p_interaction)
+
+#write.xlsx(comparison_df, file.path(data_dir, "Plot03_comparison_df.xlsx"), rowNames = TRUE)
+#ggsave(file.path(fig_dir, "04_p_Proteomic Directionality by Variant Type.pdf"), p_interaction, width = 7, height = 7)
+
+#save.image(file = "API_physicochemical variants_pairs.RData")
+```

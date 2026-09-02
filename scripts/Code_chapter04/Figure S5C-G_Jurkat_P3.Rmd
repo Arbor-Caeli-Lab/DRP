@@ -1,0 +1,1704 @@
+---
+title: "Figure S5C-G"
+output: html_document
+date: "2026-04-21"
+---
+
+```{r Load Data}
+source(file.path(knitr::current_input(dir = TRUE), "..", "_common", "repro_paths.R"))
+paths <- repro_paths("Code_chapter04")
+repo_root <- paths$repo_root
+input_dir <- paths$input_dir
+data_dir <- paths$results_dir
+fig_dir <- paths$results_dir
+folder_path <- input_dir
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(readxl)
+library(patchwork)
+tox_data <- read_excel(file.path(input_dir, "01_Jurkat_Metabolic.xlsx"))
+prot_data <- read.csv(file.path(input_dir, "Jurkat_combined_aligned_matrix.csv"), row.names = 1)
+
+cat(sprintf("\nProteomics data: %d samples × %d proteins\n", 
+            nrow(prot_data), ncol(prot_data)))
+
+
+# ── Parse sample names (drug name + concentration) ──
+sample_info <- data.frame(
+  Sample = rownames(prot_data),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    # Extract drug name and concentration
+    Drug = sub("_[0-9]+nM$", "", Sample),
+    Concentration_str = sub(".*_", "", Sample),
+    # Convert to numeric (unit: nM)
+    Concentration_nM = as.numeric(gsub("nM", "", Concentration_str))
+  )
+
+cat("\nSample parsing example:\n")
+print(head(sample_info))
+
+# Check for parsing errors
+if (any(is.na(sample_info$Concentration_nM))) {
+  cat("\n⚠️ Warning: Some sample concentrations failed to parse\n")
+  print(sample_info %>% filter(is.na(Concentration_nM)))
+}
+```
+
+# STEP 1: Calculate CPS-6
+
+```{r}
+#  STEP 1: Calculate CPS-6
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 1: Calculate CPS-6 Score\n")
+cat("════════════════════════════════════════════════════\n")
+
+# ── CPS-6 coefficients trained on HepG2 ──
+CPS6_WEIGHTS <- c(
+                "O60907" = -20.98158776,
+                "P54920" = 20.5753442197846,
+                "Q6IQ23" = -11.15330576,
+               "P33121" = 20.7759376060599,
+                "Q9NVJ2" = 19.0564075502228,
+                "Q9GZT6" = 13.6959600455126
+)
+
+CPS6_PROTEINS <- names(CPS6_WEIGHTS)
+CPS6_GENES <- c("TBL1X", "NAPA", "PLEKHA7", "ACSL1", 
+                "ARL8B", "CCDC90B")
+
+# ── Check whether all 6 proteins are present in the data ──
+cat("\nCPS-6 protein check:\n")
+for (i in seq_along(CPS6_PROTEINS)) {
+  p <- CPS6_PROTEINS[i]
+  g <- CPS6_GENES[i]
+  status <- ifelse(p %in% colnames(prot_data), "✓", "✗ Missing")
+  cat(sprintf("  %s (%s): %s\n", g, p, status))
+}
+
+missing_proteins <- CPS6_PROTEINS[!CPS6_PROTEINS %in% colnames(prot_data)]
+if (length(missing_proteins) > 0) {
+  cat(sprintf("\n⚠️ Warning: %d CPS-6 proteins are missing and will be treated as 0\n", 
+              length(missing_proteins)))
+}
+
+# ── Calculate CPS-6 score (vectorized) ──
+CPS6_score <- rep(0, nrow(prot_data))
+names(CPS6_score) <- rownames(prot_data)
+
+for (i in seq_along(CPS6_PROTEINS)) {
+  p <- CPS6_PROTEINS[i]
+  w <- CPS6_WEIGHTS[i]
+  
+  if (p %in% colnames(prot_data)) {
+    CPS6_score <- CPS6_score + w * prot_data[, p]
+  }
+}
+
+# ── Assemble result table ──
+CPS6_jurkat <- sample_info %>%
+  mutate(CPS6 = CPS6_score[Sample])
+
+cat(sprintf("\nCPS-6 calculation completed: %d samples\n", nrow(CPS6_jurkat)))
+cat("CPS-6 distribution:\n")
+print(summary(CPS6_jurkat$CPS6))
+```
+
+#  STEP 2: Integrate toxicity metrics
+
+```{r}
+#  STEP 2: Integrate toxicity metrics
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 2: Integrate toxicity data\n")
+cat("════════════════════════════════════════════════════\n")
+
+# ── Reshape Relative Intensity data (wide → long) ──
+tox_long <- tox_data %>%
+  pivot_longer(
+    cols = starts_with("Relative intensity"),
+    names_to = "Concentration_label",
+    values_to = "Relative_Intensity"
+  ) %>%
+  mutate(
+    # Extract concentration values
+    Concentration_nM = case_when(
+      grepl("0$", Concentration_label) ~ 0,
+      grepl("1 nM", Concentration_label) ~ 1,
+      grepl("10 nM", Concentration_label) ~ 10,
+      grepl("100 nM", Concentration_label) ~ 100,
+      grepl("1000 nM", Concentration_label) ~ 1000,
+      grepl("10000 nM", Concentration_label) ~ 10000,
+      TRUE ~ NA_real_
+    ),
+    # Calculate inhibition rate (assume Relative Intensity = 1 means no inhibition)
+    Inhibition_Rate = (1 - Relative_Intensity) * 100
+  )
+
+cat("Toxicity data (long format):\n")
+print(head(tox_long))
+
+# ── Merge CPS-6 with toxicity data ──
+CPS6_with_tox <- CPS6_jurkat %>%
+  left_join(
+    tox_long %>% dplyr::select(Drug, Concentration_nM, Relative_Intensity, Inhibition_Rate),
+    by = c("Drug", "Concentration_nM")
+  ) %>%
+  left_join(
+    tox_data %>% dplyr::select(Drug, EC50, AUC, R2, Slope),
+    by = "Drug"
+  )
+
+cat(sprintf("\nMerged data: %d rows\n", nrow(CPS6_with_tox)))
+cat(sprintf("Samples with inhibition rate: %d\n", sum(!is.na(CPS6_with_tox$Inhibition_Rate))))
+
+# ── Remove 0 nM (control) samples ──
+CPS6_valid <- CPS6_with_tox %>%
+  filter(Concentration_nM > 0, !is.na(Inhibition_Rate))
+
+cat(sprintf("Valid samples (0 nM removed): %d\n", nrow(CPS6_valid)))
+```
+
+#  STEP 3: CPS-6 vs toxicity correlation
+
+```{r}
+#  STEP 3: CPS-6 vs toxicity correlation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 3: CPS-6 vs toxicity correlation analysis\n")
+cat("════════════════════════════════════════════════════\n")
+
+# ── 3.1: CPS-6 vs Inhibition Rate (overall) ──
+ct_overall <- cor.test(CPS6_valid$CPS6, CPS6_valid$Inhibition_Rate,
+                       method = "spearman", exact = FALSE)
+
+cat(sprintf("\nCPS-6 vs Inhibition Rate (all concentrations):\n"))
+cat(sprintf("  Spearman ρ = %+.3f\n", ct_overall$estimate))
+cat(sprintf("  p-value    = %.2e\n", ct_overall$p.value))
+cat(sprintf("  n          = %d\n", nrow(CPS6_valid)))
+
+# ── 3.2: Analysis by concentration ──
+cat("\nCorrelation by concentration:\n")
+conc_cor <- CPS6_valid %>%
+  group_by(Concentration_nM) %>%
+  summarise(
+    n = n(),
+    rho = cor(CPS6, Inhibition_Rate, method = "spearman", use = "complete.obs"),
+    p_value = cor.test(CPS6, Inhibition_Rate, method = "spearman", 
+                       exact = FALSE)$p.value,
+    .groups = "drop"
+  ) %>%
+  arrange(Concentration_nM)
+
+print(conc_cor)
+
+# ── 3.3: CPS-6 vs EC50 ──
+# Each drug has only one EC50; take the mean CPS-6 across concentrations
+CPS6_by_drug <- CPS6_valid %>%
+  group_by(Drug) %>%
+  summarise(
+    Mean_CPS6 = mean(CPS6, na.rm = TRUE),
+    Max_CPS6 = max(CPS6, na.rm = TRUE),
+    EC50 = first(EC50),
+    AUC = first(AUC),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(EC50), EC50 > 0, EC50 < 1e10)  # Remove invalid EC50
+
+cat(sprintf("\nDrug-level summary: %d drugs\n", nrow(CPS6_by_drug)))
+
+if (nrow(CPS6_by_drug) >= 10) {
+  
+  ct_ec50 <- cor.test(CPS6_by_drug$Mean_CPS6, log10(CPS6_by_drug$EC50),
+                      method = "spearman", exact = FALSE)
+  
+  cat(sprintf("\nMean CPS-6 vs log10(EC50):\n"))
+  cat(sprintf("  Spearman ρ = %+.3f\n", ct_ec50$estimate))
+  cat(sprintf("  p-value    = %.2e\n", ct_ec50$p.value))
+  
+  # Negative correlation → higher CPS-6 means lower EC50 (more sensitive)
+  # Positive correlation → higher CPS-6 means higher EC50 (more resistant)
+  
+  ct_auc <- cor.test(CPS6_by_drug$Mean_CPS6, CPS6_by_drug$AUC,
+                     method = "spearman", exact = FALSE)
+  
+  cat(sprintf("\nMean CPS-6 vs AUC:\n"))
+  cat(sprintf("  Spearman ρ = %+.3f\n", ct_auc$estimate))
+  cat(sprintf("  p-value    = %.2e\n", ct_auc$p.value))
+}
+
+# ── 3.4: Visualization 1 – Scatter plot (all concentrations) ──
+
+p1 <- ggplot(CPS6_valid, aes(CPS6, Inhibition_Rate)) +
+  geom_point(aes(color = factor(Concentration_nM)), alpha = 0.6, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  scale_color_brewer(palette = "Spectral", name = "Concentration (nM)") +
+  geom_text_repel(
+    data = CPS6_valid %>% 
+      filter(abs(CPS6) > quantile(abs(CPS6), 0.95) | 
+             Inhibition_Rate > quantile(Inhibition_Rate, 0.95)),
+    aes(label = Drug), size = 2.2, max.overlaps = 15
+  ) +
+  labs(
+    title = "CPS-6 Score vs Inhibition Rate in Jurkat",
+    subtitle = sprintf("All concentrations | Spearman ρ = %.3f, p = %.1e, n = %d",
+                       ct_overall$estimate, ct_overall$p.value, nrow(CPS6_valid)),
+    x = "CPS-6 Score (HepG2-trained)",
+    y = "Inhibition Rate (%)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom", aspect.ratio = 0.85)
+
+print(p1)
+
+# ── 3.5: Visualization 2 – Faceted by concentration ──
+
+p2 <- ggplot(CPS6_valid, aes(CPS6, Inhibition_Rate)) +
+  geom_point(aes(color = factor(Concentration_nM)), alpha = 0.6, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.7) +
+  scale_color_brewer(palette = "Spectral") +
+  facet_wrap(~ paste0(Concentration_nM, " nM"), scales = "free") +
+  geom_text(
+    data = conc_cor,
+    aes(label = sprintf("ρ=%.2f\np=%.1e", rho, p_value)),
+    x = -Inf, y = Inf, hjust = -0.1, vjust = 1.2,
+    size = 3, inherit.aes = FALSE
+  ) +
+  labs(
+    title = "CPS-6 vs Inhibition: Stratified by Concentration",
+    x = "CPS-6 Score", y = "Inhibition Rate (%)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+print(p2)
+
+# ── 3.6: Visualization 3 – CPS-6 vs EC50 ──
+
+if (nrow(CPS6_by_drug) >= 10) {
+  
+  p3 <- ggplot(CPS6_by_drug, aes(Mean_CPS6, log10(EC50))) +
+    geom_point(aes(color = AUC, size = abs(Mean_CPS6)), alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+    scale_color_gradient2(low = "blue", mid = "white", high = "red", 
+                          midpoint = 1, name = "AUC") +
+    scale_size_continuous(range = c(2, 8), name = "|CPS-6|") +
+    geom_text_repel(
+      data = CPS6_by_drug %>% 
+        filter(abs(Mean_CPS6) > quantile(abs(Mean_CPS6), 0.9)),
+      aes(label = Drug), size = 2.5, max.overlaps = 15
+    ) +
+    labs(
+      title = "Mean CPS-6 vs Drug Potency (EC50) in Jurkat",
+      subtitle = sprintf("Spearman ρ = %.3f, p = %.1e | n = %d drugs",
+                         ct_ec50$estimate, ct_ec50$p.value, nrow(CPS6_by_drug)),
+      x = "Mean CPS-6 Score (across concentrations)",
+      y = "log10(EC50, nM)"
+    ) +
+    theme_bw() +
+    theme(legend.position = "bottom", aspect.ratio = 0.85)
+  
+  print(p3)
+}
+```
+#  STEP 4: Dose-response analysis
+
+```{r}
+#  STEP 4: Dose-response analysis 
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 4: Dose-response curve analysis\n")
+cat("════════════════════════════════════════════════════\n")
+
+library(drc)
+
+# ── Select drugs with complete concentration data (≥4 points) ──
+drugs_complete <- CPS6_valid %>%
+  group_by(Drug) %>%
+  summarise(N_conc = n_distinct(Concentration_nM), .groups = "drop") %>%
+  filter(N_conc >= 4) %>%
+  pull(Drug)
+
+cat(sprintf("Drugs with ≥4 concentration points: %d\n", length(drugs_complete)))
+
+# ── Fit dose-response curves for CPS-6 and toxicity for each drug ──
+
+dose_response_results <- data.frame(
+  Drug = character(),
+  CPS6_EC50 = numeric(),
+  CPS6_Hill = numeric(),
+  CPS6_Top = numeric(),
+  CPS6_Bottom = numeric(),
+  Toxicity_EC50 = numeric(),
+  Toxicity_Hill = numeric(),
+  CPS6_fit_success = logical(),
+  Tox_fit_success = logical(),
+  stringsAsFactors = FALSE
+)
+
+# Fit the first 30 drugs as an example (full fitting may be slow)
+drugs_to_fit <- drugs_complete[1:min(30, length(drugs_complete))]
+
+cat(sprintf("Fitting dose-response curves: %d drugs\n", length(drugs_to_fit)))
+
+for (drug in drugs_to_fit) {
+  
+  sub <- CPS6_valid %>% filter(Drug == drug)
+  
+  if (nrow(sub) < 4) next
+  
+  # ── Fit CPS-6 dose-response ──
+  CPS6_fit_ok <- FALSE
+  CPS6_ec50 <- NA
+  CPS6_hill <- NA
+  CPS6_top <- NA
+  CPS6_bottom <- NA
+  
+  tryCatch({
+    fit_CPS6 <- drm(CPS6 ~ Concentration_nM, data = sub,
+                    fct = LL.4(names = c("Slope", "Lower", "Upper", "EC50")))
+    
+    CPS6_ec50 <- coef(fit_CPS6)["EC50:(Intercept)"]
+    CPS6_hill <- coef(fit_CPS6)["Slope:(Intercept)"]
+    CPS6_bottom <- coef(fit_CPS6)["Lower:(Intercept)"]
+    CPS6_top <- coef(fit_CPS6)["Upper:(Intercept)"]
+    CPS6_fit_ok <- TRUE
+    
+  }, error = function(e) {
+    # Fit failed, keep NA
+  })
+  
+  # ── Fit toxicity dose-response ──
+  tox_fit_ok <- FALSE
+  tox_ec50 <- NA
+  tox_hill <- NA
+  
+  tryCatch({
+    fit_tox <- drm(Inhibition_Rate ~ Concentration_nM, data = sub,
+                   fct = LL.4(names = c("Slope", "Lower", "Upper", "EC50")))
+    
+    tox_ec50 <- coef(fit_tox)["EC50:(Intercept)"]
+    tox_hill <- coef(fit_tox)["Slope:(Intercept)"]
+    tox_fit_ok <- TRUE
+    
+  }, error = function(e) {
+    # Fit failed
+  })
+  
+  # Save results
+  dose_response_results <- rbind(
+    dose_response_results,
+    data.frame(
+      Drug = drug,
+      CPS6_EC50 = CPS6_ec50,
+      CPS6_Hill = CPS6_hill,
+      CPS6_Top = CPS6_top,
+      CPS6_Bottom = CPS6_bottom,
+      Toxicity_EC50 = tox_ec50,
+      Toxicity_Hill = tox_hill,
+      CPS6_fit_success = CPS6_fit_ok,
+      Tox_fit_success = tox_fit_ok
+    )
+  )
+}
+
+cat(sprintf("\nFitting results:\n"))
+cat(sprintf("  CPS-6 fit successful: %d / %d\n", 
+            sum(dose_response_results$CPS6_fit_success),
+            nrow(dose_response_results)))
+cat(sprintf("  Toxicity fit successful: %d / %d\n", 
+            sum(dose_response_results$Tox_fit_success),
+            nrow(dose_response_results)))
+
+# ── EC50 correlation analysis ──
+valid_ec50 <- dose_response_results %>%
+  filter(CPS6_fit_success, Tox_fit_success,
+         CPS6_EC50 > 0, CPS6_EC50 < 1e10,
+         Toxicity_EC50 > 0, Toxicity_EC50 < 1e10)
+
+cat(sprintf("\nValid EC50 pairs: %d\n", nrow(valid_ec50)))
+
+if (nrow(valid_ec50) >= 5) {
+  
+  ct_ec50_pair <- cor.test(log10(valid_ec50$CPS6_EC50), 
+                           log10(valid_ec50$Toxicity_EC50),
+                           method = "spearman", exact = FALSE)
+  
+  cat(sprintf("\nEC50(CPS-6) vs EC50(Toxicity):\n"))
+  cat(sprintf("  Spearman ρ = %+.3f\n", ct_ec50_pair$estimate))
+  cat(sprintf("  p-value    = %.2e\n", ct_ec50_pair$p.value))
+  
+  # Visualization
+  p_ec50 <- ggplot(valid_ec50, aes(log10(CPS6_EC50), log10(Toxicity_EC50))) +
+    geom_point(size = 3, alpha = 0.7, color = "#d73027") +
+    geom_smooth(method = "lm", se = TRUE, color = "black") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+    geom_text_repel(aes(label = Drug), size = 2.5, max.overlaps = 15) +
+    labs(
+      title = "CPS-6 EC50 vs Cytotoxicity EC50 in Jurkat",
+      subtitle = sprintf("4-parameter logistic fit | ρ = %.3f, p = %.1e, n = %d",
+                         ct_ec50_pair$estimate, ct_ec50_pair$p.value, 
+                         nrow(valid_ec50)),
+      x = "log10(CPS-6 EC50, nM)",
+      y = "log10(Cytotoxicity EC50, nM)"
+    ) +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.5,
+             label = "Diagonal = perfect correlation\nAbove = CPS-6 more sensitive\nBelow = Toxicity more sensitive",
+             size = 3, color = "gray40") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(p_ec50)
+}
+```
+#  STEP 5: Dose-response patterns of the six proteins
+
+```{r}
+#  STEP 5: Dose-response patterns of the six proteins
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 5: CPS-6 protein dose-response (transposed version)\n")
+cat("════════════════════════════════════════════════════\n")
+
+CPS6_PROTEINS <- c(
+  "P54920",  
+  "Q6IQ23",  
+  "O60907",
+  "P33121", 
+  "Q9GZT6",
+  "Q9NVJ2"
+)
+
+# Ensure CPS6_GENES and CPS6_WEIGHTS are correctly defined
+CPS6_GENES <- c("NAPA","PLEKHA7","TBL1X", "ACSL1", 
+                "CCDC90B","ARL8B")
+
+CPS6_WEIGHTS <- c(
+  "O60907" = -20.98158776,
+  "P54920" = 20.5753442197846,
+  "Q6IQ23" = -11.15330576,
+  "P33121" = 20.7759376060599,
+  "Q9NVJ2" = 19.0564075502228,
+  "Q9GZT6" = 13.6959600455126
+)
+
+
+
+# ── Extract log2FC of the proteins ──
+CPS6_proteins_long <- prot_data[, CPS6_PROTEINS] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Sample") %>%
+  pivot_longer(-Sample, names_to = "UniProt", values_to = "Log2FC") %>%
+  left_join(sample_info, by = "Sample") %>%
+  filter(Concentration_nM > 0) %>%
+  mutate(
+    Gene = CPS6_GENES[match(UniProt, CPS6_PROTEINS)],
+    Weight = CPS6_WEIGHTS[UniProt],
+    Weight_Label = sprintf("%s (w=%+.1f)", Gene, Weight)
+  )
+
+cat(sprintf("CPS-6 protein data: %d rows\n", nrow(CPS6_proteins_long)))
+
+# ── Concentration trend for each protein ──
+protein_dose_summary <- CPS6_proteins_long %>%
+  group_by(Gene, Weight, Concentration_nM) %>%
+  summarise(
+    Mean_L2FC = mean(Log2FC, na.rm = TRUE),
+    SD_L2FC = sd(Log2FC, na.rm = TRUE),
+    SE_L2FC = SD_L2FC / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Weight_Label = sprintf("%s (w=%+.1f)", Gene, Weight),
+    # Add log concentration for plotting
+    Log10_Conc = log10(Concentration_nM)
+  )
+
+# ── Visualization: transposed dose-response curves (log2FC on X, concentration on Y) ──
+p_protein_dose_transposed <- ggplot(protein_dose_summary, 
+                                   aes(x = Mean_L2FC, y = Log10_Conc)) +
+  geom_line(aes(color = Gene), linewidth = 1) +
+  geom_point(aes(color = Gene), size = 2) +
+  # Error band also transposed
+  geom_ribbon(aes(xmin = Mean_L2FC - SE_L2FC, 
+                  xmax = Mean_L2FC + SE_L2FC,
+                  fill = Gene), alpha = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~ Weight_Label, scales = "free_x", ncol = 4) +
+  # Y-axis labels need custom breaks
+  scale_y_continuous(breaks = log10(c(1, 10, 100, 1000, 10000)),
+                     labels = c("1", "10", "100", "1k", "10k")) +
+  labs(
+    title = "CPS-6 Proteins: Dose-Response Patterns in Jurkat (Transposed)",
+    subtitle = "Mean ± SE across all drugs | Y-axis: concentration (log scale)",
+    x = "Mean log2FC",
+    y = "Concentration (nM, log scale)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 8, face = "bold"))
+
+print(p_protein_dose_transposed)
+
+# ── Analysis: still compute early vs late response, but interpretation changes ──
+protein_early_late <- protein_dose_summary %>%
+  group_by(Gene) %>%
+  summarise(
+    L2FC_at_1nM = Mean_L2FC[Concentration_nM == 1],
+    L2FC_at_10000nM = Mean_L2FC[Concentration_nM == 10000],
+    Max_AbsL2FC = max(abs(Mean_L2FC), na.rm = TRUE),
+    Conc_at_Max = Concentration_nM[which.max(abs(Mean_L2FC))],
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Response_Type = case_when(
+      Conc_at_Max <= 10 ~ "Early responder (≤10nM)",
+      Conc_at_Max >= 1000 ~ "Late responder (≥1μM)",
+      TRUE ~ "Mid responder"
+    )
+  )
+
+cat("\nProtein response types:\n")
+print(protein_early_late %>% dplyr::select(Gene, Response_Type, Conc_at_Max, Max_AbsL2FC))
+```
+
+#  STEP 6: Concentration-normalized analysis
+
+```{r}
+#  STEP 6: Concentration-normalized analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 6: Distinguish dose-driven vs mechanism-driven signals\n")
+cat("════════════════════════════════════════════════════\n")
+
+# ── For each protein, fit log2FC ~ log10(Conc) and extract residuals ──
+
+CPS6_residuals <- CPS6_proteins_long %>%
+  group_by(UniProt, Gene) %>%
+  mutate(
+    Log10_Conc = log10(Concentration_nM),
+    # Residual = observed – concentration-predicted
+    L2FC_residual = residuals(lm(Log2FC ~ Log10_Conc))
+  ) %>%
+  ungroup()
+
+# ── Recalculate CPS-6 using residuals ──
+# First convert back to wide format
+CPS6_residual_wide <- CPS6_residuals %>%
+  dplyr::select(Sample, UniProt, L2FC_residual) %>%
+  pivot_wider(names_from = UniProt, values_from = L2FC_residual) %>%
+  tibble::column_to_rownames("Sample")
+
+# Compute residual CPS-6
+CPS6_residual_score <- rep(0, nrow(CPS6_residual_wide))
+names(CPS6_residual_score) <- rownames(CPS6_residual_wide)
+
+for (p in CPS6_PROTEINS) {
+  if (p %in% colnames(CPS6_residual_wide)) {
+    CPS6_residual_score <- CPS6_residual_score + 
+      CPS6_WEIGHTS[p] * CPS6_residual_wide[, p]
+  }
+}
+
+# ── Compare original CPS-6 vs residual CPS-6 ──
+comparison_df <- CPS6_valid %>%
+  mutate(
+    CPS6_original = CPS6,
+    CPS6_residual = CPS6_residual_score[Sample]
+  ) %>%
+  filter(!is.na(CPS6_residual))
+
+# Correlation
+ct_original <- cor.test(comparison_df$CPS6_original, 
+                        comparison_df$Inhibition_Rate,
+                        method = "spearman", exact = FALSE)
+
+ct_residual <- cor.test(comparison_df$CPS6_residual, 
+                        comparison_df$Inhibition_Rate,
+                        method = "spearman", exact = FALSE)
+
+cat("\nCPS-6 vs Inhibition Rate:\n")
+cat(sprintf("  Original CPS-6:  ρ = %+.3f, p = %.2e\n", 
+            ct_original$estimate, ct_original$p.value))
+cat(sprintf("  Residual CPS-6:  ρ = %+.3f, p = %.2e\n", 
+            ct_residual$estimate, ct_residual$p.value))
+
+if (abs(ct_residual$estimate) > abs(ct_original$estimate)) {
+  cat("\n✓ Residual CPS-6 shows stronger correlation → CPS-6 captures mechanism rather than dose signal\n")
+} else {
+  cat("\n⚠️ Original CPS-6 shows stronger correlation → CPS-6 partly reflects overall perturbation strength\n")
+}
+
+# ── Visualization comparison ──
+p_compare <- comparison_df %>%
+  dplyr::select(Sample, Drug, Concentration_nM, Inhibition_Rate, 
+         CPS6_original, CPS6_residual) %>%
+  pivot_longer(cols = c(CPS6_original, CPS6_residual),
+               names_to = "CPS6_Type", values_to = "CPS6_Value") %>%
+  mutate(CPS6_Type = recode(CPS6_Type,
+                            "CPS6_original" = "Original (with dose effect)",
+                            "CPS6_residual" = "Residual (dose-corrected)")) %>%
+  ggplot(aes(CPS6_Value, Inhibition_Rate)) +
+  geom_point(aes(color = factor(Concentration_nM)), alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  scale_color_brewer(palette = "Spectral", name = "Conc (nM)") +
+  facet_wrap(~ CPS6_Type, scales = "free_x") +
+  labs(
+    title = "Original vs Dose-Corrected CPS-6",
+    subtitle = sprintf("Original ρ=%.3f | Residual ρ=%.3f",
+                       ct_original$estimate, ct_residual$estimate),
+    x = "CPS-6 Score", y = "Inhibition Rate (%)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+print(p_compare)
+```
+#  STEP 7: Recalibrate CPS-6 coefficients for Jurkat cells
+
+```{r}
+#  Recalibrate CPS-6 coefficients for Jurkat cells
+# ═══════════════════════════════════════════════════════════════════════════════
+
+library(glmnet)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  CPS-6 coefficient recalibration analysis\n")
+cat("════════════════════════════════════════════════════\n")
+
+# ── 1. Prepare training data ──
+CPS6_PROTEINS <- c(
+  "O60907",
+  "P33121",
+"P54920",
+"Q9NVJ2",
+"Q9GZT6",
+"Q6IQ23")
+
+# Ensure CPS6_GENES and CPS6_WEIGHTS are correctly defined
+CPS6_GENES <- c("TBL1X", "ACSL1", "NAPA", "ARL8B","CCDC90B","PLEKHA7")
+
+
+
+
+# Use only valid samples (those with inhibition rate)
+valid_samples <- CPS6_valid$Sample
+training_data <- prot_data[valid_samples, CPS6_PROTEINS]
+
+# Ensure all samples and proteins exist
+if (any(!valid_samples %in% rownames(prot_data))) {
+  cat("⚠️ Warning: Some valid samples are missing from the proteomics data\n")
+}
+
+if (any(!CPS6_PROTEINS %in% colnames(prot_data))) {
+  cat("⚠️ Warning: Some CPS-6 proteins are missing from the proteomics data\n")
+  missing_proteins <- CPS6_PROTEINS[!CPS6_PROTEINS %in% colnames(prot_data)]
+  cat("  Missing proteins: ", paste(missing_proteins, collapse=", "), "\n")
+}
+
+# Create training matrix X (protein expression) and response vector y (inhibition rate)
+X <- as.matrix(training_data)
+y <- CPS6_valid$Inhibition_Rate
+log_conc <- log10(CPS6_valid$Concentration_nM)
+
+# Add concentration as a covariate
+X_with_conc <- cbind(X, Log10_Conc = log_conc)
+
+# ── 2. Fit elastic-net model ──
+# Set concentration as unpenalized
+penalty_factor <- c(rep(1, ncol(X)), 0)  # Last column (concentration) is not penalized
+
+cat("\nTraining Jurkat-specific CPS-6 model...\n")
+
+set.seed(42)  # Ensure reproducibility
+
+# Check sample size and dimensions
+cat(sprintf("Training data: %d samples, %d features (including concentration)\n", 
+            nrow(X_with_conc), ncol(X_with_conc)))
+
+# Cross-validation to select optimal lambda
+cv_fit <- cv.glmnet(
+  X_with_conc, y,
+  alpha = 0.5,  # Elastic-net mixing parameter, 0.5 balances L1 and L2
+  nfolds = 5,   # 5-fold cross-validation
+  penalty.factor = penalty_factor,  # Concentration not penalized
+  standardize = TRUE  # Standardize features
+)
+
+# Extract best model coefficients
+best_coef <- coef(cv_fit, s = "lambda.min")
+
+# Extract protein coefficients
+jurkat_coefficients <- best_coef[2:(length(CPS6_PROTEINS)+1), 1]
+names(jurkat_coefficients) <- CPS6_PROTEINS
+
+# Get intercept and concentration coefficient
+intercept <- best_coef["(Intercept)", 1]
+conc_coef <- best_coef["Log10_Conc", 1]
+
+# ── 3. Compare original vs recalibrated coefficients ──
+# Original HepG2 coefficients
+hepg2_coefficients <- c(
+  "O60907" = -20.98158776,
+  "P54920" = 20.5753442197846,
+  "Q6IQ23" = -11.15330576,
+  "P33121" = 20.7759376060599,
+  "Q9NVJ2" = 19.0564075502228,
+  "Q9GZT6" = 13.6959600455126 
+)
+
+# Create comparison table
+coef_comparison <- data.frame(
+  Protein = names(jurkat_coefficients),
+  Gene = CPS6_GENES,
+  HepG2_coef = hepg2_coefficients[names(jurkat_coefficients)],
+  Jurkat_coef = jurkat_coefficients,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    Abs_Change = abs(Jurkat_coef - HepG2_coef),
+    Rel_Change = Abs_Change / abs(HepG2_coef),
+    Sign_Flip = sign(Jurkat_coef) != sign(HepG2_coef),
+    Direction = ifelse(Jurkat_coef > 0, "Up → Toxicity", "Down → Toxicity")
+  ) %>%
+  arrange(desc(abs(Jurkat_coef)))  # Sort by absolute coefficient value
+
+cat("\nCoefficient comparison:\n")
+print(coef_comparison)
+
+cat(sprintf("\nJurkat model intercept: %.4f\n", intercept))
+cat(sprintf("Jurkat concentration coefficient: %.4f\n", conc_coef))
+
+# ── 4. Calculate recalibrated CPS-6 scores ──
+# Recompute CPS-6 using Jurkat coefficients
+jurkat_CPS6 <- rep(0, nrow(prot_data))
+names(jurkat_CPS6) <- rownames(prot_data)
+
+for (p in names(jurkat_coefficients)) {
+  if (p %in% colnames(prot_data)) {
+    jurkat_CPS6 <- jurkat_CPS6 + jurkat_coefficients[p] * prot_data[, p]
+  }
+}
+
+# Add intercept and concentration effect for valid samples
+jurkat_CPS6_full <- jurkat_CPS6
+jurkat_CPS6_full[valid_samples] <- jurkat_CPS6_full[valid_samples] + 
+  intercept + conc_coef * log10(CPS6_valid$Concentration_nM)
+
+# Create data frame containing both original and recalibrated CPS-6
+CPS6_comparison <- CPS6_valid %>%
+  mutate(
+    Original_CPS6 = CPS6,
+    Jurkat_CPS6 = jurkat_CPS6[Sample],
+    Jurkat_CPS6_full = jurkat_CPS6_full[Sample]
+  )
+
+# ── 5. Evaluate recalibrated model performance ──
+# Correlation of original CPS-6
+ct_original <- cor.test(
+  CPS6_comparison$Original_CPS6,
+  CPS6_comparison$Inhibition_Rate,
+  method = "spearman", exact = FALSE
+)
+
+# Correlation of Jurkat-recalibrated CPS-6 (proteins only)
+ct_jurkat <- cor.test(
+  CPS6_comparison$Jurkat_CPS6,
+  CPS6_comparison$Inhibition_Rate,
+  method = "spearman", exact = FALSE
+)
+
+# Full model (with intercept and concentration)
+ct_jurkat_full <- cor.test(
+  CPS6_comparison$Jurkat_CPS6_full,
+  CPS6_comparison$Inhibition_Rate,
+  method = "spearman", exact = FALSE
+)
+
+# R² on training set
+pred <- predict(cv_fit, X_with_conc, s = "lambda.min")
+r2_train <- 1 - sum((y - pred)^2) / sum((y - mean(y))^2)
+
+cat("\nPerformance comparison:\n")
+cat(sprintf("  Original HepG2-CPS-6:  ρ = %.3f, p = %.2e\n", 
+            ct_original$estimate, ct_original$p.value))
+cat(sprintf("  Recalibrated Jurkat-CPS-6:  ρ = %.3f, p = %.2e\n", 
+            ct_jurkat$estimate, ct_jurkat$p.value))
+cat(sprintf("  Full Jurkat model:  ρ = %.3f, p = %.2e, R² = %.3f\n", 
+            ct_jurkat_full$estimate, ct_jurkat_full$p.value, r2_train))
+
+# ── 6. Visualization ──
+# 6.1 Coefficient comparison bar plot
+p_coef <- ggplot(coef_comparison, 
+                aes(x = reorder(Gene, abs(Jurkat_coef)), 
+                    y = Jurkat_coef)) +
+  geom_col(aes(fill = Direction), alpha = 0.8) +
+  geom_point(aes(y = HepG2_coef), shape = 18, size = 3, color = "red") +
+  scale_fill_manual(values = c("Up → Toxicity" = "#d73027", 
+                              "Down → Toxicity" = "#4575b4")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "CPS-6 Coefficients: Jurkat-Recalibrated vs HepG2-Original",
+    subtitle = "Bars = Jurkat coefficients | Red diamonds = HepG2 coefficients",
+    x = "",
+    y = "Coefficient Value"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    legend.position = "bottom",
+    legend.title = element_blank()
+  )
+
+# 6.2 CPS-6 score comparison scatter plot
+p_compare <- ggplot(CPS6_comparison, 
+                   aes(Original_CPS6, Jurkat_CPS6)) +
+  geom_point(aes(color = factor(Concentration_nM)), alpha = 0.6, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  geom_smooth(method = "lm", color = "black") +
+  scale_color_brewer(palette = "Spectral", name = "Conc (nM)") +
+  labs(
+    title = "Original vs Jurkat-Recalibrated CPS-6 Scores",
+    x = "Original HepG2-CPS-6",
+    y = "Jurkat-Recalibrated CPS-6"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+# 6.3 Recalibrated CPS-6 vs inhibition rate
+p_jurkat <- ggplot(CPS6_comparison, 
+                  aes(Jurkat_CPS6, Inhibition_Rate)) +
+  geom_point(aes(color = factor(Concentration_nM)), alpha = 0.6, size = 2) +
+  geom_smooth(method = "lm", color = "black") +
+  scale_color_brewer(palette = "Spectral", name = "Conc (nM)") +
+  labs(
+    title = "Jurkat-Recalibrated CPS-6 vs Inhibition Rate",
+    subtitle = sprintf("Spearman ρ = %.3f, p = %.1e", 
+                      ct_jurkat$estimate, ct_jurkat$p.value),
+    x = "Jurkat-Recalibrated CPS-6",
+    y = "Inhibition Rate (%)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+# 6.4 Comparison by concentration
+# Compute correlation for each concentration
+conc_compare <- data.frame()
+
+for (conc in sort(unique(CPS6_comparison$Concentration_nM))) {
+  subset_data <- CPS6_comparison %>% filter(Concentration_nM == conc)
+  
+  ct_orig <- cor.test(subset_data$Original_CPS6, subset_data$Inhibition_Rate,
+                      method = "spearman", exact = FALSE)
+  
+  ct_jurkat <- cor.test(subset_data$Jurkat_CPS6, subset_data$Inhibition_Rate,
+                        method = "spearman", exact = FALSE)
+  
+  conc_compare <- rbind(conc_compare, data.frame(
+    Concentration_nM = conc,
+    Original_rho = ct_orig$estimate,
+    Original_p = ct_orig$p.value,
+    Jurkat_rho = ct_jurkat$estimate,
+    Jurkat_p = ct_jurkat$p.value,
+    n = nrow(subset_data),
+    Improvement = ct_jurkat$estimate - ct_orig$estimate
+  ))
+}
+
+p_conc_compare <- ggplot(conc_compare, aes(x = factor(Concentration_nM))) +
+  geom_col(aes(y = Original_rho), fill = "gray70", alpha = 0.7, width = 0.4,
+          position = position_nudge(x = -0.2)) +
+  geom_col(aes(y = Jurkat_rho), fill = "#d73027", alpha = 0.7, width = 0.4,
+          position = position_nudge(x = 0.2)) +
+  geom_text(aes(y = Original_rho, 
+               label = sprintf("ρ=%.2f", Original_rho)),
+            position = position_nudge(x = -0.2, y = 0.02),
+            vjust = -0.5, size = 3, color = "gray30") +
+  geom_text(aes(y = Jurkat_rho, 
+               label = sprintf("ρ=%.2f", Jurkat_rho)),
+            position = position_nudge(x = 0.2, y = 0.02),
+            vjust = -0.5, size = 3, color = "#d73027") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "CPS-6 Performance by Concentration: Original vs Recalibrated",
+    subtitle = "Gray = HepG2-Original | Red = Jurkat-Recalibrated",
+    x = "Concentration (nM)",
+    y = "Spearman ρ"
+  ) +
+  theme_bw()
+
+# Display plots
+cat("\nGenerating plots...\n")
+print(p_coef)
+print(p_compare)
+print(p_jurkat)
+print(p_conc_compare)
+
+# Combined plot
+combined_plots <- (p_coef | p_compare) / (p_jurkat | p_conc_compare) +
+  plot_annotation(
+    title = "CPS-6 Recalibration for Jurkat T-Cell Leukemia",
+    theme = theme(plot.title = element_text(size = 16, face = "bold"))
+  )
+
+print(combined_plots)
+```
+
+# STEP 8: Run the model
+```{r}
+# ── Parse sample names ──
+sample_info <- data.frame(
+  Sample = rownames(prot_data),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    Drug = sub("_[0-9]+nM$", "", Sample),
+    Concentration_str = sub(".*_", "", Sample),
+    Concentration_nM = as.numeric(gsub("nM", "", Concentration_str))
+  )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 1: Calculate CPS-6 using the full Jurkat model
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 1: Calculate Jurkat-CPS-6 Score (full model)\n")
+cat("════════════════════════════════════════════════════\n")
+
+# ── Jurkat-recalibrated CPS-6 coefficients ──
+# Note: using the recalibrated coefficients here
+JURKAT_CPS6_WEIGHTS <- c(
+   "O60907" = 3.882342,
+  "P54920" = -14.383957,
+  "Q6IQ23" = -11.183872,
+  "P33121" = 21.075092,
+  "Q9NVJ2" = -13.779085,
+  "Q9GZT6" = 9.222744 
+)
+
+# Intercept and concentration coefficient
+JURKAT_INTERCEPT <- -4.8432
+JURKAT_CONC_COEF <- 3.9142
+
+CPS6_PROTEINS <- names(JURKAT_CPS6_WEIGHTS)
+CPS6_GENES <- c("TBL1X", "NAPA", "PLEKHA7", "ACSL1", 
+                "ARL8B", "CCDC90B")
+
+# ── Check proteins ─
+cat("\nJurkat-CPS-6 protein check:\n")
+for (i in seq_along(CPS6_PROTEINS)) {
+  p <- CPS6_PROTEINS[i]
+  g <- CPS6_GENES[i]
+  w <- JURKAT_CPS6_WEIGHTS[i]
+  status <- ifelse(p %in% colnames(prot_data), "✓", "✗ Missing")
+  cat(sprintf("  %s (%s): %s | weight = %+.3f\n", g, p, status, w))
+}
+
+# ── Calculate base CPS-6 (protein part only) ──
+CPS6_base <- rep(0, nrow(prot_data))
+names(CPS6_base) <- rownames(prot_data)
+
+for (i in seq_along(CPS6_PROTEINS)) {
+  p <- CPS6_PROTEINS[i]
+  w <- JURKAT_CPS6_WEIGHTS[i]
+  
+  if (p %in% colnames(prot_data)) {
+    CPS6_base <- CPS6_base + w * prot_data[, p]
+  }
+}
+
+# ── Assemble result table and add full model terms ──
+CPS6_jurkat <- sample_info %>%
+  mutate(
+    CPS6_base = CPS6_base[Sample],  # protein-only part
+    Log10_Conc = log10(Concentration_nM),
+    # Full model = intercept + protein part + concentration effect
+    CPS6_full = JURKAT_INTERCEPT + CPS6_base + JURKAT_CONC_COEF * Log10_Conc
+  )
+
+cat(sprintf("\nJurkat-CPS-6 calculation completed: %d samples\n", nrow(CPS6_jurkat)))
+cat("\nFull model formula:\n")
+cat(sprintf("  CPS-6 = %.4f (intercept)\n", JURKAT_INTERCEPT))
+cat(sprintf("        + Σ(wi × protein_i)\n"))
+cat(sprintf("        + %.4f × log10(Concentration_nM)\n", JURKAT_CONC_COEF))
+
+cat("\nBase CPS-6 distribution (protein only):\n")
+print(summary(CPS6_jurkat$CPS6_base))
+
+cat("\nFull CPS-6 distribution (intercept + concentration):\n")
+print(summary(CPS6_jurkat$CPS6_full))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 2: Integrate toxicity data (unchanged)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 2: Integrate toxicity data\n")
+cat("════════════════════════════════════════════════════\n")
+
+tox_long <- tox_data %>%
+  pivot_longer(
+    cols = starts_with("Relative intensity"),
+    names_to = "Concentration_label",
+    values_to = "Relative_Intensity"
+  ) %>%
+  mutate(
+    Concentration_nM = case_when(
+      grepl("0$", Concentration_label) ~ 0,
+      grepl("1 nM", Concentration_label) ~ 1,
+      grepl("10 nM", Concentration_label) ~ 10,
+      grepl("100 nM", Concentration_label) ~ 100,
+      grepl("1000 nM", Concentration_label) ~ 1000,
+      grepl("10000 nM", Concentration_label) ~ 10000,
+      TRUE ~ NA_real_
+    ),
+    Inhibition_Rate = (1 - Relative_Intensity) * 100
+  )
+
+CPS6_with_tox <- CPS6_jurkat %>%
+  left_join(
+    tox_long %>% dplyr::select(Drug, Concentration_nM, Relative_Intensity, Inhibition_Rate),
+    by = c("Drug", "Concentration_nM")
+  ) %>%
+  left_join(
+    tox_data %>% dplyr::select(Drug, EC50, AUC, R2, Slope),
+    by = "Drug"
+  )
+
+CPS6_valid <- CPS6_with_tox %>%
+  filter(Concentration_nM > 0, !is.na(Inhibition_Rate))
+
+cat(sprintf("Valid samples: %d\n", nrow(CPS6_valid)))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 3: CPS-6 vs toxicity correlation (using full model)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 3: Full Jurkat-CPS-6 vs toxicity correlation\n")
+cat("════════════════════════════════════════════════════\n")
+
+# ── Correlation using full model ──
+ct_full <- cor.test(CPS6_valid$CPS6_full, CPS6_valid$Inhibition_Rate,
+                    method = "spearman", exact = FALSE)
+
+cat(sprintf("\nFull Jurkat-CPS-6 vs Inhibition Rate:\n"))
+cat(sprintf("  Spearman ρ = %+.3f\n", ct_full$estimate))
+cat(sprintf("  p-value    = %.2e\n", ct_full$p.value))
+cat(sprintf("  n          = %d\n", nrow(CPS6_valid)))
+
+# Also compute correlation for base model (protein only) for comparison
+ct_base <- cor.test(CPS6_valid$CPS6_base, CPS6_valid$Inhibition_Rate,
+                    method = "spearman", exact = FALSE)
+
+cat(sprintf("\nBase Jurkat-CPS-6 (protein only) vs Inhibition Rate:\n"))
+cat(sprintf("  Spearman ρ = %+.3f\n", ct_base$estimate))
+cat(sprintf("  p-value    = %.2e\n", ct_base$p.value))
+
+cat(sprintf("\nImprovement of full model: Δρ = %+.3f\n", ct_full$estimate - ct_base$estimate))
+
+# ── Analysis by concentration ──
+conc_cor_full <- CPS6_valid %>%
+  group_by(Concentration_nM) %>%
+  summarise(
+    n = n(),
+    rho_full = cor(CPS6_full, Inhibition_Rate, method = "spearman", use = "complete.obs"),
+    p_full = cor.test(CPS6_full, Inhibition_Rate, method = "spearman", 
+                     exact = FALSE)$p.value,
+    rho_base = cor(CPS6_base, Inhibition_Rate, method = "spearman", use = "complete.obs"),
+    p_base = cor.test(CPS6_base, Inhibition_Rate, method = "spearman", 
+                     exact = FALSE)$p.value,
+    .groups = "drop"
+  ) %>%
+  arrange(Concentration_nM)
+
+cat("\nCorrelation by concentration (full vs base model):\n")
+print(conc_cor_full)
+
+# ── Visualization: full model ──
+p1_full <- ggplot(CPS6_valid, aes(CPS6_full, Inhibition_Rate)) +
+  geom_point(aes(color = factor(Concentration_nM)), alpha = 0.6, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  scale_color_brewer(palette = "Spectral", name = "Concentration (nM)") +
+  geom_text_repel(
+    data = CPS6_valid %>% 
+      filter(abs(CPS6_full) > quantile(abs(CPS6_full), 0.95, na.rm = TRUE) | 
+             Inhibition_Rate > quantile(Inhibition_Rate, 0.95)),
+    aes(label = Drug), size = 2.2, max.overlaps = 15
+  ) +
+  labs(
+    title = "Complete Jurkat-CPS-6 Model vs Inhibition Rate",
+    subtitle = sprintf("With intercept + concentration | Spearman ρ = %.3f, p = %.1e, n = %d",
+                       ct_full$estimate, ct_full$p.value, nrow(CPS6_valid)),
+    x = "Jurkat-CPS-6 Score (Intercept + Proteins + Conc)",
+    y = "Inhibition Rate (%)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom", aspect.ratio = 0.85)
+
+print(p1_full)
+
+# ── Faceted by concentration (full model) ──
+p2_full <- ggplot(CPS6_valid, aes(CPS6_full, Inhibition_Rate)) +
+  geom_point(aes(color = factor(Concentration_nM)), alpha = 0.6, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.7) +
+  scale_color_brewer(palette = "Spectral") +
+  facet_wrap(~ paste0(Concentration_nM, " nM"), scales = "free") +
+  geom_text(
+    data = conc_cor_full,
+    aes(label = sprintf("ρ=%.2f\np=%.1e", rho_full, p_full)),
+    x = -Inf, y = Inf, hjust = -0.1, vjust = 1.2,
+    size = 3, inherit.aes = FALSE
+  ) +
+  labs(
+    title = "Complete Jurkat-CPS-6 vs Inhibition: Stratified by Concentration",
+    x = "Jurkat-CPS-6 Score (Complete Model)", 
+    y = "Inhibition Rate (%)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+print(p2_full)
+
+#write.xlsx(CPS6_valid, file.path(data_dir, "Plot01_Jurkat_CPS6_score.xlsx"))
+
+
+# ── Comparison plot: full model vs base model ──
+p_comparison <- CPS6_valid %>%
+  dplyr::select(Sample, Drug, Concentration_nM, Inhibition_Rate, CPS6_base, CPS6_full) %>%
+  pivot_longer(cols = c(CPS6_base, CPS6_full),
+               names_to = "Model", values_to = "CPS6_Value") %>%
+  mutate(Model = recode(Model,
+                       "CPS6_base" = sprintf("Base (proteins only)\nρ=%.3f", ct_base$estimate),
+                       "CPS6_full" = sprintf("Complete (+ intercept + conc)\nρ=%.3f", ct_full$estimate))) %>%
+  ggplot(aes(CPS6_Value, Inhibition_Rate)) +
+  geom_point(aes(color = factor(Concentration_nM)), alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  scale_color_brewer(palette = "Spectral", name = "Conc (nM)") +
+  facet_wrap(~ Model, scales = "free_x") +
+  labs(
+    title = "Jurkat-CPS-6: Base Model vs Complete Model",
+    subtitle = sprintf("Complete model improves correlation by Δρ = %+.3f",
+                       ct_full$estimate - ct_base$estimate),
+    x = "CPS-6 Score", 
+    y = "Inhibition Rate (%)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+print(p_comparison)
+
+# ── CPS-6 vs EC50 (using full model) ──
+CPS6_by_drug <- CPS6_valid %>%
+  group_by(Drug) %>%
+  summarise(
+    Mean_CPS6_full = mean(CPS6_full, na.rm = TRUE),
+    Mean_CPS6_base = mean(CPS6_base, na.rm = TRUE),
+    EC50 = first(EC50),
+    AUC = first(AUC),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(EC50), EC50 > 0, EC50 < 1e10)
+
+if (nrow(CPS6_by_drug) >= 10) {
+  
+  ct_ec50_full <- cor.test(CPS6_by_drug$Mean_CPS6_full, log10(CPS6_by_drug$EC50),
+                          method = "spearman", exact = FALSE)
+  
+  ct_ec50_base <- cor.test(CPS6_by_drug$Mean_CPS6_base, log10(CPS6_by_drug$EC50),
+                          method = "spearman", exact = FALSE)
+  
+  cat(sprintf("\nFull model vs log10(EC50): ρ = %+.3f, p = %.2e\n",
+              ct_ec50_full$estimate, ct_ec50_full$p.value))
+  cat(sprintf("Base model vs log10(EC50): ρ = %+.3f, p = %.2e\n",
+              ct_ec50_base$estimate, ct_ec50_base$p.value))
+  
+  p3_full <- ggplot(CPS6_by_drug, aes(Mean_CPS6_full, log10(EC50))) +
+    geom_point(aes(color = AUC, size = abs(Mean_CPS6_full)), alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+    scale_color_gradient2(low = "blue", mid = "white", high = "red", 
+                          midpoint = 1, name = "AUC") +
+    scale_size_continuous(range = c(2, 8), name = "|CPS-6|") +
+    geom_text_repel(
+      data = CPS6_by_drug %>% 
+        filter(abs(Mean_CPS6_full) > quantile(abs(Mean_CPS6_full), 0.9)),
+      aes(label = Drug), size = 2.5, max.overlaps = 15
+    ) +
+    labs(
+      title = "Complete Jurkat-CPS-6 vs Drug Potency (EC50)",
+      subtitle = sprintf("Spearman ρ = %.3f, p = %.1e | n = %d drugs",
+                         ct_ec50_full$estimate, ct_ec50_full$p.value, 
+                         nrow(CPS6_by_drug)),
+      x = "Mean Jurkat-CPS-6 Score (Complete Model)",
+      y = "log10(EC50, nM)"
+    ) +
+    theme_bw() +
+    theme(legend.position = "bottom", aspect.ratio = 0.85)
+  
+  print(p3_full)
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 5: Protein dose-response (using Jurkat coefficients)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 5: CPS-6 protein dose-response (Jurkat coefficients)\n")
+cat("════════════════════════════════════════════════════\n")
+
+# Use Jurkat coefficients instead of HepG2 coefficients
+CPS6_proteins_long <- prot_data[, CPS6_PROTEINS] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Sample") %>%
+  pivot_longer(-Sample, names_to = "UniProt", values_to = "Log2FC") %>%
+  left_join(sample_info, by = "Sample") %>%
+  filter(Concentration_nM > 0) %>%
+  mutate(
+    Gene = CPS6_GENES[match(UniProt, CPS6_PROTEINS)],
+    Weight = JURKAT_CPS6_WEIGHTS[UniProt],  # Use Jurkat coefficients
+    Weight_Label = sprintf("%s (Jurkat w=%+.1f)", Gene, Weight)
+  )
+
+protein_dose_summary <- CPS6_proteins_long %>%
+  group_by(Gene, Weight, Concentration_nM) %>%
+  summarise(
+    Mean_L2FC = mean(Log2FC, na.rm = TRUE),
+    SD_L2FC = sd(Log2FC, na.rm = TRUE),
+    SE_L2FC = SD_L2FC / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Weight_Label = sprintf("%s (Jurkat w=%+.1f)", Gene, Weight),
+    Log10_Conc = log10(Concentration_nM)
+  )
+
+p_protein_dose <- ggplot(protein_dose_summary, 
+                         aes(x = Mean_L2FC, y = Log10_Conc)) +
+  geom_smooth(aes(color = Gene), method = "loess", se = FALSE, span = 0.75,
+             linewidth = 1) +  # Use smoothed curve
+  geom_point(aes(color = Gene), size = 2) +
+  geom_ribbon(aes(xmin = Mean_L2FC - SE_L2FC, 
+                  xmax = Mean_L2FC + SE_L2FC,
+                  fill = Gene), alpha = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~ Weight_Label, scales = "free_x", ncol = 4) +
+  scale_y_continuous(breaks = log10(c(1, 10, 100, 1000, 10000)),
+                     labels = c("1", "10", "100", "1k", "10k")) +
+  labs(
+    title = "CPS-6 Proteins: Dose-Response with Jurkat-Recalibrated Weights",
+    subtitle = "Smoothed curves | Weights reflect Jurkat-specific coefficients",
+    x = "Mean log2FC",
+    y = "Concentration (nM, log scale)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 8, face = "bold"))
+
+print(p_protein_dose)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Summary report
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n\n")
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║      Full Jurkat-CPS-6 Model Validation Report                  ║\n")
+cat("╠══════════════════════════════════════════════════════════════════╣\n")
+cat("║                                                                  ║\n")
+cat("║  Model parameters                                                ║\n")
+cat(sprintf("║    Intercept:          %.4f                                     ║\n", JURKAT_INTERCEPT))
+cat(sprintf("║    Concentration coef: %.4f (log10 scale)                       ║\n", JURKAT_CONC_COEF))
+cat(sprintf("║    Number of proteins: %d                                        ║\n", length(CPS6_PROTEINS)))
+cat("║                                                                  ║\n")
+cat("║  Predictive performance                                          ║\n")
+cat(sprintf("║    Base model:      ρ = %.3f (p = %.1e)                      ║\n",
+            ct_base$estimate, ct_base$p.value))
+cat(sprintf("║    Full model:      ρ = %.3f (p = %.1e)                      ║\n",
+            ct_full$estimate, ct_full$p.value))
+cat(sprintf("║    Improvement:     Δρ = %+.3f                               ║\n",
+            ct_full$estimate - ct_base$estimate))
+cat("║                                                                  ║\n")
+cat("║  Sample statistics                                               ║\n")
+cat(sprintf("║    Total samples:   %d                                        ║\n", nrow(CPS6_valid)))
+cat(sprintf("║    Number of drugs: %d                                        ║\n", length(unique(CPS6_valid$Drug))))
+cat("╚══════════════════════════════════════════════════════════════════╝\n")
+```
+
+# STEP 9: protein_dose_curve ploting
+
+```{r}
+library(tidyverse)
+library(splines)
+
+p_protein_dose_curve <- ggplot(protein_dose_summary, 
+                               aes(x = Log10_Conc, y = Mean_L2FC, 
+                                   color = Gene, fill = Gene)) +
+  
+  # 1. Baseline
+  geom_hline(yintercept = 0, linetype = "dashed", 
+             color = "gray50", linewidth = 0.6) +
+  
+  # 2. Error ribbon (semi-transparent background)
+  geom_ribbon(aes(ymin = Mean_L2FC - SE_L2FC, 
+                  ymax = Mean_L2FC + SE_L2FC),
+              alpha = 0.2, color = NA) +
+  
+  # 3. Smoothed curve
+  geom_smooth(method = "lm", 
+              formula = y ~ ns(x, df = 4),
+              se = FALSE,
+              linewidth = 1.8,
+              alpha = 0.9) +
+  
+  # 4. Error bars
+  geom_errorbar(aes(ymin = Mean_L2FC - SE_L2FC, 
+                    ymax = Mean_L2FC + SE_L2FC), 
+                width = 0.15,       
+                linewidth = 0.8,     
+                alpha = 0.8) +      
+  
+  # 5. Data points
+  geom_point(size = 3.5, shape = 21, stroke = 1.2, 
+             fill = "white", alpha = 1) + 
+  
+  # 6. X-axis
+  scale_x_continuous(breaks = log10(c(1, 10, 100, 1000, 10000)),
+                     labels = c("1", "10", "100", "1k", "10k")) +
+  
+  # 7. Color palette
+  scale_color_brewer(palette = "Set2", name = "Protein") +
+  scale_fill_brewer(palette = "Set2", name = "Protein") +
+  
+  # 8. Labels
+  labs(
+    title = "CPS-6 Proteins: Dose-Response Curves",
+    subtitle = "Fitted using natural cubic splines with error bars (±SE)",
+    x = bquote("Concentration (" * log[10] * " nM)"),
+    y = bquote("Protein Perturbation (" * log[2] ~ "FC)")
+  ) + 
+  
+  # 9. Theme
+  theme_bw(base_size = 12) +
+  theme(
+    aspect.ratio = 1,  # Square aspect ratio
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 11),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "gray30")
+  )
+
+print(p_protein_dose_curve)
+
+#write.xlsx(protein_dose_summary, file.path(data_dir,"Plot02_protein_dose_summary.xlsx"))
+#ggsave(file.path(fig_dir, "Plot02_rotein_dose_summary.pdf"), p_protein_dose_curve, width = 7, height = 7)
+```
+
+# STEP 10：ROC
+
+```{r}
+library(pROC) 
+drug_sens <- read_excel(file.path(input_dir, "jurkat_full_report_20260414_193920.xlsx"))
+
+CPS6_cls <- CPS6_with_tox %>%
+  left_join(drug_sens %>% 
+              dplyr::select(Drug_Name, Classification, consensus_ic50_um) %>% 
+              dplyr::rename(Drug = Drug_Name),
+            by = "Drug") %>%
+  filter(!is.na(Classification)) %>%
+  filter(Classification %in% c("Effective", "Marginal", "Inactive")) %>%
+  mutate(Classification = factor(Classification,
+                                 levels = c("Effective", "Marginal", "Inactive")))
+
+# View merged data
+cat(sprintf("\nMerged data: %d samples\n", nrow(CPS6_cls)))
+cat("Classification counts:\n"); print(table(CPS6_cls$Classification))
+
+# Descriptive statistics
+desc <- CPS6_cls %>%
+  group_by(Classification) %>%
+  summarise(n = n(), 
+            mean = mean(CPS6_full, na.rm = TRUE), 
+            median = median(CPS6_full, na.rm = TRUE),
+            sd = sd(CPS6_full, na.rm = TRUE), 
+            .groups = "drop")
+cat("\nDescriptive statistics:\n"); print(desc)
+
+# Kruskal-Wallis test
+kw <- kruskal.test(CPS6_full ~ Classification, data = CPS6_cls)
+cat(sprintf("\nKruskal-Wallis: χ² = %.2f, p = %.2e\n", kw$statistic, kw$p.value))
+
+# Pairwise Wilcoxon tests
+pw <- pairwise.wilcox.test(CPS6_cls$CPS6_full, CPS6_cls$Classification,
+                          p.adjust.method = "BH")
+cat("\nPairwise Wilcoxon (BH-adjusted):\n"); print(pw)
+
+# Effect size calculation
+cat("\nEffect sizes:\n")
+for (pair in list(c("Effective", "Inactive"),
+                  c("Effective", "Marginal"),
+                  c("Marginal", "Inactive"))) {
+  g1 <- CPS6_cls$CPS6_full[CPS6_cls$Classification == pair[1]]
+  g2 <- CPS6_cls$CPS6_full[CPS6_cls$Classification == pair[2]]
+  if(length(g1) > 0 && length(g2) > 0) {
+    psd <- sqrt(((length(g1) - 1) * var(g1, na.rm = TRUE) + 
+                 (length(g2) - 1) * var(g2, na.rm = TRUE)) /
+                (length(g1) + length(g2) - 2))
+    d <- (mean(g1, na.rm = TRUE) - mean(g2, na.rm = TRUE)) / psd
+    delta <- mean(outer(g1, g2, function(a, b) sign(a - b)), na.rm = TRUE)
+    cat(sprintf("  %s vs %s: Cohen d = %+.3f, Cliff δ = %+.3f\n",
+              pair[1], pair[2], d, delta))
+  } else {
+    cat(sprintf("  %s vs %s: cannot compute (insufficient samples)\n", pair[1], pair[2]))
+  }
+}
+
+# Visualization colors
+clr <- c(Effective = "#d73027", Marginal = "#fc8d59", Inactive = "#4575b4")
+
+# Boxplot
+y_max <- max(CPS6_cls$CPS6_full, na.rm = TRUE)
+y_min <- min(CPS6_cls$CPS6_full, na.rm = TRUE)
+y_rng <- y_max - y_min
+
+p2 <- ggplot(CPS6_cls, aes(Classification, CPS6_full, fill = Classification)) +
+  geom_boxplot(alpha = .7, outlier.shape = NA, width = .6) +
+  geom_jitter(aes(shape = factor(Concentration_nM)), width = .15, alpha = .5, size = 2) +
+  scale_fill_manual(values = clr) +
+  scale_shape_manual(values = c("1" = 17, "10" = 15, "100" = 16, "1000" = 18),
+                    name = "Conc (nM)") +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4) +
+  labs(title = "Jurkat CPS-6 Score by Drug Sensitivity Classification",
+       subtitle = sprintf("Kruskal-Wallis p = %.2e | ◆ = mean", kw$p.value),
+       x = "", y = "Jurkat CPS-6 Score") +
+  theme_bw() + theme(legend.position = "bottom",
+                     axis.text.x = element_text(size = 12, face = "bold"))
+
+# Add significance annotations (if samples are sufficient)
+if(all(c("Effective", "Inactive") %in% unique(CPS6_cls$Classification)) && 
+   "Inactive" %in% rownames(pw$p.value) && "Effective" %in% colnames(pw$p.value)) {
+  p2 <- p2 + 
+    annotate("segment", x = 1, xend = 3,
+             y = y_max + y_rng * .08, yend = y_max + y_rng * .08) +
+    annotate("text", x = 2, y = y_max + y_rng * .12,
+             label = sprintf("p = %.2e", pw$p.value["Inactive", "Effective"]),
+             size = 3.5, fontface = "bold")
+}
+
+if(all(c("Effective", "Marginal") %in% unique(CPS6_cls$Classification)) && 
+   "Marginal" %in% rownames(pw$p.value) && "Effective" %in% colnames(pw$p.value)) {
+  p2 <- p2 +
+    annotate("segment", x = 1, xend = 2,
+             y = y_max + y_rng * .01, yend = y_max + y_rng * .01) +
+    annotate("text", x = 1.5, y = y_max + y_rng * .05,
+             label = sprintf("p = %.2e", pw$p.value["Marginal", "Effective"]),
+             size = 3)
+}
+
+# Density plot
+p3 <- ggplot(CPS6_cls, aes(CPS6_full, fill = Classification, color = Classification)) +
+  geom_density(alpha = .25, linewidth = 1) +
+  geom_rug(alpha = .5) +
+  geom_vline(data = desc, aes(xintercept = median, color = Classification),
+            linetype = "dashed", linewidth = 1) +
+  scale_fill_manual(values = clr) + scale_color_manual(values = clr) +
+  labs(title = "Jurkat CPS-6 Score Density", subtitle = "Dashed = median",
+       x = "CPS-6 Score", y = "Density") +
+  theme_bw() + theme(legend.position = "bottom")
+
+print(p2 | p3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 4: ROC analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  STEP 4: ROC analysis\n")
+cat("════════════════════════════════════════════════════\n")
+
+# Effective vs Inactive comparison
+ei <- CPS6_cls %>%
+  filter(Classification %in% c("Effective", "Inactive")) %>%
+  mutate(Label = ifelse(Classification == "Effective", 1, 0))
+library(pROC)
+library(dplyr)
+library(ggplot2)
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("--- ROC analysis stratified by concentration ---\n")
+cat("════════════════════════════════════════════════════\n")
+
+# Store ROC results for different concentrations
+roc_results_by_conc <- list()
+
+for (conc in sort(unique(ei$Concentration_nM))) {
+  # Subset data for current concentration
+  sub_ei <- ei %>% filter(Concentration_nM == conc)
+  
+  # Ensure both Effective and Inactive are present and sample size is adequate
+  if(nrow(sub_ei) >= 5 && length(unique(sub_ei$Label)) > 1) {
+    roc_obj <- roc(sub_ei$Label, sub_ei$CPS6_full, quiet = TRUE)
+    
+    # 1. Compute 95% CI
+    ci_obj <- ci.auc(roc_obj)
+    
+    # 2. Get optimal threshold (maximum Youden Index) and corresponding sensitivity/specificity
+    best_coords <- coords(roc_obj, "best", ret=c("threshold", "sensitivity", "specificity"), best.method="youden")
+    
+    # Take the first best threshold in case of ties
+    best_thresh <- best_coords$threshold[1]
+    best_sens   <- best_coords$sensitivity[1]
+    best_spec   <- best_coords$specificity[1]
+    
+    roc_results_by_conc[[as.character(conc)]] <- data.frame(
+      Concentration = paste0(conc, " nM"),
+      FPR = 1 - roc_obj$specificities,
+      TPR = roc_obj$sensitivities,
+      AUC = as.numeric(auc(roc_obj))
+    )
+    
+    # 3. Print detailed results
+    cat(sprintf("%7g nM | AUC = %.3f [%.3f - %.3f] | Cutoff: %+.3f | Sens: %5.1f%%, Spec: %5.1f%% | (Eff=%d, Ina=%d)\n", 
+                conc, 
+                auc(roc_obj), ci_obj[1], ci_obj[3], 
+                best_thresh, best_sens * 100, best_spec * 100,
+                sum(sub_ei$Label==1), sum(sub_ei$Label==0)))
+  }
+}
+
+# Plot ROC curves stratified by concentration
+if(length(roc_results_by_conc) > 0) {
+  plot_data_roc_conc <- bind_rows(roc_results_by_conc) %>%
+    mutate(Legend_Label = sprintf("%s (AUC=%.2f)", Concentration, AUC))
+  
+  p_roc_conc <- ggplot(plot_data_roc_conc, aes(x = FPR, y = TPR, color = Legend_Label)) +
+    geom_line(linewidth = 1) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+    scale_color_brewer(palette = "Set1", name = "Concentration (AUC)") +
+    labs(title = "ROC Curves Stratified by Concentration",
+         subtitle = "Predicting Drug Efficacy (Effective vs Inactive)",
+         x = "1 − Specificity (FPR)", y = "Sensitivity (TPR)") +
+    theme_bw() + theme(aspect.ratio = 1, legend.position = "right")
+  
+  print(p_roc_conc)
+}
+
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("--- Drug-level aggregated ROC analysis ---\n")
+cat("════════════════════════════════════════════════════\n")
+
+# Aggregate to drug level using max or mean CPS-6
+ei_drug_level <- ei %>%
+  group_by(Drug, Label) %>%
+  summarise(
+    Max_CPS6 = max(CPS6_full, na.rm = TRUE),
+    Mean_CPS6 = mean(CPS6_full, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+if(nrow(ei_drug_level) >= 5 && length(unique(ei_drug_level$Label)) > 1) {
+  
+  # ---------- Predictor 1: Max CPS-6 ----------
+  roc_drug_max <- roc(ei_drug_level$Label, ei_drug_level$Max_CPS6, quiet = TRUE)
+  ci_max <- ci.auc(roc_drug_max)
+  best_max <- coords(roc_drug_max, "best", ret=c("threshold", "sensitivity", "specificity"), best.method="youden")
+  
+  cat(sprintf("【Max CPS-6】 \n  AUC = %.3f [%.3f - %.3f]\n  Cutoff: %+.3f  -->  Sens: %.1f%%, Spec: %.1f%%\n\n", 
+              auc(roc_drug_max), ci_max[1], ci_max[3], 
+              best_max$threshold[1], best_max$sensitivity[1]*100, best_max$specificity[1]*100))
+  
+  # ---------- Predictor 2: Mean CPS-6 ----------
+  roc_drug_mean <- roc(ei_drug_level$Label, ei_drug_level$Mean_CPS6, quiet = TRUE)
+  ci_mean <- ci.auc(roc_drug_mean)
+  best_mean <- coords(roc_drug_mean, "best", ret=c("threshold", "sensitivity", "specificity"), best.method="youden")
+  
+  cat(sprintf("【Mean CPS-6】\n  AUC = %.3f [%.3f - %.3f]\n  Cutoff: %+.3f  -->  Sens: %.1f%%, Spec: %.1f%%\n", 
+              auc(roc_drug_mean), ci_mean[1], ci_mean[3], 
+              best_mean$threshold[1], best_mean$sensitivity[1]*100, best_mean$specificity[1]*100))
+  
+  # Plot data
+  drug_roc_df <- rbind(
+    data.frame(FPR = 1 - roc_drug_max$specificities, TPR = roc_drug_max$sensitivities, 
+               Model = sprintf("Max CPS-6 (AUC=%.2f)", auc(roc_drug_max))),
+    data.frame(FPR = 1 - roc_drug_mean$specificities, TPR = roc_drug_mean$sensitivities, 
+               Model = sprintf("Mean CPS-6 (AUC=%.2f)", auc(roc_drug_mean)))
+  )
+  
+  p_roc_drug <- ggplot(drug_roc_df, aes(x = FPR, y = TPR, color = Model)) +
+    geom_line(linewidth = 1.2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+    labs(title = "Drug-Level ROC Analysis",
+         subtitle = paste0("N = ", nrow(ei_drug_level), " unique drugs"),
+         x = "1 − Specificity", y = "Sensitivity") +
+    theme_bw() + theme(aspect.ratio = 1, legend.position = "bottom")
+  
+  print(p_roc_drug)
+}
+
+
+#write.xlsx(drug_roc_df, file.path(data_dir,"Plot03_Jurkat_ROC.xlsx"))
+#ggsave(file.path(fig_dir, "Plot03_Jurkat_ROC.pdf"), p_roc_drug, width = 7, height = 7)
+```
+
+# STEP 11：CPS6_Classification
+
+```{r}
+library(ggpubr)
+
+if(length(unique(CPS6_cls$Concentration_nM)) > 1) {
+    
+    # Define comparison pairs (based on the three-class scheme)
+    my_comparisons <- list(
+        c("Effective", "Marginal"),
+        c("Marginal", "Inactive"),
+        c("Effective", "Inactive")
+    )
+    
+    p5 <- ggplot(CPS6_cls, aes(Classification, CPS6_full, fill = Classification)) +
+        geom_boxplot(alpha = .7, outlier.shape = NA) +
+        geom_jitter(width = .15, alpha = .4, size = 1.5) +
+        scale_fill_manual(values = clr) +
+        facet_wrap(~ paste0(Concentration_nM, " nM"), nrow = 1) +
+        # ── Overall Kruskal-Wallis p (top of each facet) ──
+        stat_compare_means(method = "kruskal.test", 
+                           label = "p.format",
+                           label.y.npc = 0.95, size = 3) +
+        # ── Pairwise comparisons (Wilcoxon) ──
+        stat_compare_means(comparisons = my_comparisons,
+                           method = "wilcox.test",
+                           label = "p.format",   # Use stars; change to "p.format" for numeric p-values
+                           size = 3) +
+        labs(title = "Jurkat CPS-6 by Classification, Within Each Concentration",
+             x = "", y = "CPS-6 Score") +
+        theme_bw() + 
+        theme(legend.position = "none",
+              axis.text.x = element_text(angle = 30, hjust = 1))
+    
+    print(p5)
+}
+
+#write.xlsx(CPS6_cls, file.path(data_dir,"Plot04_Jurkat_CPS6_classification.xlsx"))
+#ggsave(file.path(fig_dir, "Plot04_Jurkat_CPS6_classification.pdf"), p5, width = 7, height = 7)
+#save.image("Jurkat_CPS6.RData")
+```
+
+
+

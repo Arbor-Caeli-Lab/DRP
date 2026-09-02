@@ -1,0 +1,741 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-06-21"
+---
+
+```{r setup, include=FALSE}
+source(file.path(knitr::current_input(dir = TRUE), "..", "_common", "repro_paths.R"))
+paths <- repro_paths("Code_chapter05")
+repo_root <- paths$repo_root
+input_dir <- paths$input_dir
+data_dir <- file.path(paths$results_dir, "output_data")
+fig_dir <- data_dir
+dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+
+# --- Load required packages ---
+library(openxlsx)
+library(dplyr)
+library(wCorr)
+
+# --- Step 1: Read data ---
+cat("=== Step 1: Read data ===\n")
+final_l2fc_matrix_drugs_only <- read.xlsx(
+  file.path(input_dir, "12_Final_L2FC_Matrix_Drugs_Only_367_with_label.xlsx"),rowNames = TRUE)
+
+mat <- as.matrix(final_l2fc_matrix_drugs_only)
+cat("Matrix dimensions: Number of proteins =", nrow(mat), "; Number of drugs =", ncol(mat), "\n\n")
+
+# --- Step 2: Calculate Spearman correlation matrix ---
+cat("=== Step 2: Calculate Spearman correlation matrix ===\n")
+drug_cor_spearman <- cor(mat, method = "spearman", use = "pairwise.complete.obs")
+cat("Correlation matrix dimensions:", dim(drug_cor_spearman), "\n\n")
+
+# --- Step 3: Find the most similar partner for each drug ---
+cat("=== Step 3: Find the most similar partner for each drug ===\n")
+
+# 3a. Prepare data
+cor_matrix_spearman <- drug_cor_spearman
+if (is.null(rownames(cor_matrix_spearman))) {
+  rownames(cor_matrix_spearman) <- colnames(cor_matrix_spearman)
+}
+diag(cor_matrix_spearman) <- NA  # Remove self-correlations
+
+# 3b. Convert to long format
+full_pairs_list_spearman <- as.data.frame(
+  as.table(cor_matrix_spearman), 
+  stringsAsFactors = FALSE
+)
+names(full_pairs_list_spearman) <- c("Drug1", "Drug2", "Correlation")
+full_pairs_list_spearman <- na.omit(full_pairs_list_spearman)
+
+# 3c. Use split() and lapply() to find the best match
+list_by_drug1_spearman <- split(
+  full_pairs_list_spearman, 
+  full_pairs_list_spearman$Drug1
+)
+
+best_match_rows_spearman <- lapply(list_by_drug1_spearman, function(df) {
+  df_sorted <- df[order(df$Correlation, decreasing = TRUE), ]
+  return(df_sorted[1, ])
+})
+
+best_match_per_drug_spearman <- do.call(rbind, best_match_rows_spearman)
+rownames(best_match_per_drug_spearman) <- NULL
+names(best_match_per_drug_spearman) <- c("Drug", "BestMatch", "Spearman_Correlation")
+
+# 3d. Sort by correlation
+best_match_per_drug_spearman <- best_match_per_drug_spearman[
+  order(best_match_per_drug_spearman$Spearman_Correlation, decreasing = TRUE), 
+]
+
+cat("Most similar partner for each drug (Top 30):\n")
+print(head(best_match_per_drug_spearman, 30))
+cat("\n")
+
+# --- Step 4: Reduce to unique drug pairs (remove duplicates) ---
+cat("=== Step 4: Reduce to unique drug pairs ===\n")
+
+# 4a. Create standardized drug-pair IDs
+sorted_pairs_spearman <- t(apply(
+  best_match_per_drug_spearman[, c("Drug", "BestMatch")], 
+  1, 
+  sort
+))
+
+# 4b. Merge and remove duplicates
+temp_df_spearman <- cbind(sorted_pairs_spearman, best_match_per_drug_spearman)
+names(temp_df_spearman)[1:2] <- c("Sorted_Drug1", "Sorted_Drug2")
+unique_rows_spearman <- !duplicated(temp_df_spearman[, c("Sorted_Drug1", "Sorted_Drug2")])
+unique_best_match_pairs_spearman <- temp_df_spearman[unique_rows_spearman, ]
+
+# 4c. Select and rename final columns
+final_unique_pairs_spearman <- unique_best_match_pairs_spearman[, 
+  c("Sorted_Drug1", "Sorted_Drug2", "Spearman_Correlation")
+]
+names(final_unique_pairs_spearman)[1:2] <- c("Drug1", "Drug2")
+
+# 4d. Re-sort
+final_unique_pairs_spearman <- final_unique_pairs_spearman[
+  order(final_unique_pairs_spearman$Spearman_Correlation, decreasing = TRUE), 
+]
+rownames(final_unique_pairs_spearman) <- NULL
+
+cat("Reduced unique best-matching drug pairs (Top 30):\n")
+print(head(final_unique_pairs_spearman, 30))
+cat(paste("\nAfter reduction,", nrow(final_unique_pairs_spearman), "unique drug relationships remain\n\n"))
+
+# Export results
+data_dir <- file.path(paths$results_dir, "output_data")
+#write.xlsx(final_unique_pairs_spearman, file.path(data_dir, "01_final_unique_pairs_spearman.xlsx"))
+```
+
+
+```{r}
+# --- Step 5: Define differential protein matrix ---
+cat("=== Step 5: Define differential protein matrix ===\n")
+
+# Empirical threshold, can be adjusted according to the data distribution
+lfc_thr <- 0.75  
+cat("Log2FC threshold set to:", lfc_thr, "\n")
+
+# TRUE/FALSE matrix: whether the protein satisfies |log2FC| >= threshold under each drug treatment
+resp_mat <- abs(mat) >= lfc_thr
+resp_mat[is.na(resp_mat)] <- FALSE  # Convert NA to FALSE
+
+cat("Total number of differential proteins (in at least one drug):", 
+    sum(apply(resp_mat, 1, any)), "\n\n")
+
+# --- Step 6: Define a function to calculate multidimensional metrics for drug pairs ---
+cat("=== Step 6: Calculate multidimensional metrics for all drug pairs ===\n")
+
+get_pair_metrics <- function(d1, d2, mat, resp, min_n_strong = 10) {
+  # Spearman correlation across all proteins (overall profile similarity)
+  v1_all <- mat[, d1]
+  v2_all <- mat[, d2]
+  ok_all <- !(is.na(v1_all) | is.na(v2_all))
+  
+  if (sum(ok_all) >= 2) {
+    cor_all <- suppressWarnings(
+      cor(v1_all[ok_all], v2_all[ok_all], method = "spearman")
+    )
+  } else {
+    cor_all <- NA_real_
+  }
+  
+  # Take the union: differential proteins in either d1 or d2
+  idx_union <- resp[, d1] | resp[, d2]
+  idx_use <- idx_union & ok_all
+  n_union_use <- sum(idx_use)
+  
+  if (is.na(n_union_use) || n_union_use < min_n_strong) {
+    return(data.frame(
+      drug1      = d1,
+      drug2      = d2,
+      cor_all    = cor_all,
+      cor_strong = NA_real_,
+      n_strong   = n_union_use,
+      jaccard    = NA_real_,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  v1 <- v1_all[idx_use]
+  v2 <- v2_all[idx_use]
+  
+  cor_strong <- suppressWarnings(
+    cor(v1, v2, method = "spearman")
+  )
+  
+  # Calculate Jaccard similarity
+  idx1 <- resp[, d1]
+  idx2 <- resp[, d2]
+  union_resp  <- idx1 | idx2
+  inter_resp  <- idx1 & idx2
+  n_union     <- sum(union_resp)
+  n_intersect <- sum(inter_resp)
+  jaccard <- if (n_union > 0) n_intersect / n_union else NA_real_
+  
+  data.frame(
+    drug1      = d1,
+    drug2      = d2,
+    cor_all    = cor_all,
+    cor_strong = cor_strong,
+    n_strong   = n_union_use,
+    jaccard    = jaccard,
+    stringsAsFactors = FALSE
+  )
+}
+
+# --- Step 7: Calculate metrics for all drug pairs ---
+drugs <- colnames(mat)
+cat("Starting calculation of metrics for", choose(length(drugs), 2), "drug pairs...\n")
+
+pair_list <- combn(
+  drugs, 2,
+  FUN = function(x) {
+    get_pair_metrics(
+      d1 = x[1],
+      d2 = x[2],
+      mat = mat,
+      resp = resp_mat,
+      min_n_strong = 10
+    )
+  },
+  simplify = FALSE
+)
+
+pair_res <- do.call(rbind, pair_list)
+cat("Calculation completed!\n\n")
+
+# --- Step 8: View metric distributions ---
+cat("=== Step 8: Overview of metric distributions ===\n")
+cat("\nGlobal correlation (cor_all):\n")
+print(summary(pair_res$cor_all))
+cat("\nDifferential protein correlation (cor_strong):\n")
+print(summary(pair_res$cor_strong))
+cat("\nJaccard similarity:\n")
+print(summary(pair_res$jaccard))
+cat("\nNumber of differential proteins:\n")
+print(summary(pair_res$n_strong))
+cat("\n")
+
+# --- Step 9: Filter candidate drug pairs ---
+cat("=== Step 9: Filter highly correlated candidate drug pairs ===\n")
+
+# Threshold settings (can be adjusted according to the distributions above)
+cor_all_thr    <- 0.5   # Global correlation
+cor_strong_thr <- 0.5   # Correlation among differential proteins
+jaccard_thr    <- 0.3   # Jaccard similarity of differential protein sets
+n_strong_thr   <- 30    # Number of differential proteins
+
+cat("Filtering thresholds:\n")
+cat("  - Global correlation >=", cor_all_thr, "\n")
+cat("  - Differential protein correlation >=", cor_strong_thr, "\n")
+cat("  - Jaccard similarity >=", jaccard_thr, "\n")
+cat("  - Number of differential proteins >=", n_strong_thr, "\n\n")
+
+candidates <- pair_res %>%
+  filter(
+    !is.na(cor_all),
+    !is.na(cor_strong),
+    cor_all    >= cor_all_thr,
+    cor_strong >= cor_strong_thr,
+    jaccard    >= jaccard_thr,
+    n_strong   >= n_strong_thr
+  ) %>%
+  arrange(desc(cor_strong))
+
+cat("Number of candidate drug pairs meeting the criteria:", nrow(candidates), "\n\n")
+cat("Top 30 candidate drug pairs:\n")
+print(head(candidates, 30))
+
+# --- Step 10: Calculate weighted Spearman correlation ---
+cat("\n=== Step 10: Calculate weighted Spearman correlation ===\n")
+
+weighted_spearman <- function(d1, d2, mat) {
+  v1 <- mat[, d1]
+  v2 <- mat[, d2]
+  ok <- !(is.na(v1) | is.na(v2))
+  v1 <- v1[ok]
+  v2 <- v2[ok]
+  
+  if (length(v1) < 3) return(NA_real_)
+  
+  w <- (abs(v1) + abs(v2)) / 2
+  if (all(w == 0 | is.na(w))) return(NA_real_)
+  
+  suppressWarnings(
+    weightedCorr(
+      x = v1,
+      y = v2,
+      weights = w,
+      method = "Spearman"
+    )
+  )
+}
+
+# Add weighted Spearman correlation to candidate drug pairs
+if (nrow(candidates) > 0) {
+  candidates$w_spearman <- mapply(
+    weighted_spearman,
+    d1 = candidates$drug1,
+    d2 = candidates$drug2,
+    MoreArgs = list(mat = mat)
+  )
+  
+  candidates <- candidates %>%
+    arrange(desc(w_spearman))
+  
+  cat("Weighted Spearman correlation added successfully!\n")
+  cat("\nTop 20 candidate drug pairs (sorted by weighted Spearman):\n")
+  print(head(candidates, 20))
+}
+
+# --- Step 11: Export results ---
+cat("\n=== Step 11: Export results ===\n")
+
+
+write.xlsx(pair_res, file.path(data_dir, "02_all_drug_pairs_metrics.xlsx"))
+write.xlsx(candidates, file.path(data_dir, "03_selected_drug_pairs_candidates.xlsx"))
+```
+
+ 
+```{r}
+
+cor_threshold <- 0.5
+# Extract the upper triangular matrix (avoid duplicates)
+cor_matrix_upper <- cor_matrix_spearman
+cor_matrix_upper[lower.tri(cor_matrix_upper, diag = TRUE)] <- NA
+
+# Convert to long format
+network_edges <- as.data.frame(
+  as.table(cor_matrix_upper),
+  stringsAsFactors = FALSE
+)
+names(network_edges) <- c("Drug1", "Drug2", "Correlation")
+
+# Filter and sort
+network_edges <- network_edges %>%
+  filter(!is.na(Correlation), Correlation >= cor_threshold) %>%
+  arrange(desc(Correlation))
+
+cat(paste("Threshold >=", cor_threshold, ", retained", nrow(network_edges), "edges\n"))
+
+# View distribution
+cat("\nCorrelation distribution:\n")
+print(summary(network_edges$Correlation))
+#write.xlsx(network_edges, file.path(data_dir, "04_network_edges_0.5.xlsx"))#After export, organize Spearman_Correlation, DRP_1, DRP_2
+```
+
+
+```{r}
+library(openxlsx)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(dplyr)
+library(tidyr)
+
+# --- Read data ---
+drug_pairs <- read.xlsx(file.path(input_dir, "04_network_edges_0.5.xlsx"))
+
+cat("Original total number of drug pairs:", nrow(drug_pairs), "\n")
+
+# ============================================================
+# Step 1: Set correlation thresholds and filter
+# ============================================================
+
+cor_threshold <- 0.5  # Basic threshold
+cor_highlight <- 0.7  # Highlight threshold
+
+drug_pairs_filtered <- drug_pairs %>%
+  filter(Spearman_Correlation >= cor_threshold) %>%
+  mutate(
+    edge_type = ifelse(Spearman_Correlation >= cor_highlight, 
+                       "Strong (≥0.7)", 
+                       "Moderate (0.5-0.7)")
+  )
+
+cat("Number of drug pairs with correlation >=", cor_threshold, ":", nrow(drug_pairs_filtered), "\n")
+cat("  Among them, >=", cor_highlight, "(strong correlation):", 
+    sum(drug_pairs_filtered$Spearman_Correlation >= cor_highlight), "\n")
+cat("  Between", cor_threshold, "-", cor_highlight, "(moderate correlation):", 
+    sum(drug_pairs_filtered$Spearman_Correlation < cor_highlight), "\n\n")
+
+# ============================================================
+# Step 2: Organize the DRP classification for each drug
+# ============================================================
+
+drug_drp_1 <- drug_pairs_filtered %>%
+  select(Drug = Drug1, DRP = DRP_1) %>%
+  distinct()
+
+drug_drp_2 <- drug_pairs_filtered %>%
+  select(Drug = Drug2, DRP = DRP_2) %>%
+  distinct()
+
+drug_info <- bind_rows(drug_drp_1, drug_drp_2) %>%
+  distinct(Drug, .keep_all = TRUE) %>%
+  mutate(DRP = as.character(DRP))
+
+cat("Total number of drugs in the network:", nrow(drug_info), "\n\n")
+
+# ============================================================
+# Step 3: Define DRP color scheme
+# ============================================================
+
+drp_colors <- c(
+  "1" = "#8FCB6A",   # Light green
+  "2" = "#E89ABE",   # Pink
+  "3" = "#388E3C",   # Dark green
+  "4" = "#E6847C",   # Light red
+  "5" = "#D32F2F",   # Dark red
+  "6" = "#F5A623",   # Orange
+  "7" = "#B385C9",   # Purple
+  "8" = "#D2A679",   # Brown
+  "9" = "#6CB0C4",   # Blue
+  "10" = "#800080" 
+)
+
+drp_summary <- drug_info %>%
+  group_by(DRP) %>%
+  summarise(n_drugs = n()) %>%
+  arrange(desc(n_drugs))
+
+cat("Number of drugs in each DRP classification:\n")
+print(drp_summary)
+cat("\n")
+
+# ============================================================
+# Step 4: Create network object
+# ============================================================
+
+g <- graph_from_data_frame(
+  d = drug_pairs_filtered[, c("Drug1", "Drug2", "Spearman_Correlation", "edge_type")],
+  directed = FALSE
+)
+
+E(g)$weight <- drug_pairs_filtered$Spearman_Correlation
+E(g)$edge_type <- drug_pairs_filtered$edge_type
+
+all_nodes <- V(g)$name
+V(g)$DRP <- drug_info$DRP[match(all_nodes, drug_info$Drug)]
+V(g)$color <- drp_colors[V(g)$DRP]
+V(g)$degree <- degree(g)
+V(g)$betweenness <- betweenness(g)
+
+cat("Network statistics:\n")
+cat("  Number of nodes:", vcount(g), "\n")
+cat("  Number of edges:", ecount(g), "\n")
+cat("  Average degree:", round(mean(V(g)$degree), 2), "\n\n")
+
+# ============================================================
+# 🎯 Key modification: Fix node size parameters
+# ============================================================
+
+node_size <- 4  # Uniform node size (adjustable: 3, 4, 5, 6)
+node_stroke <- 0.8  # Node border thickness
+node_alpha <- 0.9  # Node transparency
+tg <- as_tbl_graph(g)
+
+#Plot
+# Step 1: Ensure DRP is character type
+drug_info <- drug_info %>%
+  mutate(DRP = as.character(DRP))
+
+# Step 2: Reassign node attributes
+all_nodes <- V(g)$name
+V(g)$DRP <- as.character(drug_info$DRP[match(all_nodes, drug_info$Drug)])
+
+# Step 3: Check data
+cat("Node DRP type:", class(V(g)$DRP), "\n")
+cat("Unique DRP values:", unique(V(g)$DRP), "\n")
+cat("Names of the DRP color vector:", names(drp_colors), "\n")
+
+# Step 4: Validate mapping
+test_mapping <- data.frame(
+  DRP = unique(V(g)$DRP),
+  Color = drp_colors[unique(V(g)$DRP)]
+)
+cat("\nMapping between DRP and colors:\n")
+print(test_mapping)
+
+# Step 5: Plot (using the corrected scale_fill_manual)
+p4 <- ggraph(tg, layout = 'kk') +
+  geom_edge_arc(
+    aes(width = weight, alpha = edge_type, color = edge_type),
+    strength = 0.15  # Moderate curvature
+  ) +
+  scale_edge_width(range = c(0.7, 2), name = "Spearman\nCorrelation") +
+  scale_edge_alpha_manual(
+    values = c("Strong (≥0.7)" = 0.9, "Moderate (0.5-0.7)" = 0.3),
+    name = "Edge Type"
+  ) +
+  scale_edge_color_manual(
+    values = c("Strong (≥0.7)" = "#D32F2F", "Moderate (0.5-0.7)" = "#7D8086"),
+    name = "Edge Type"
+  ) +
+  geom_node_point(
+    aes(fill = DRP),
+    shape = 21, size = node_size, color = "white",
+    stroke = node_stroke, alpha = node_alpha
+  ) +
+  scale_fill_manual(
+    values = drp_colors,
+    breaks = sort(unique(V(g)$DRP)),
+    labels = paste("DRP", sort(unique(V(g)$DRP))),
+    name = "DRP Classification",
+    na.translate = FALSE
+  ) +
+  geom_node_text(
+    aes(label = name), repel = TRUE, size = 2.5,
+    fontface = "bold", max.overlaps = 30,
+    bg.color = "white", bg.r = 0.08
+  ) +
+  theme_graph(base_family = 'sans') +
+  theme(
+    legend.position = "right", legend.box = "vertical",
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 11, face = "bold"),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 13, hjust = 0.5, color = "gray30"),
+    aspect.ratio = 1
+  ) +
+  labs(
+    title = "Drug Similarity Network (Medium Curve)",
+    subtitle = "Strength = 0.15 | Balanced curvature"
+  )
+
+fig_dir <- file.path(paths$results_dir, "output_data")
+ggsave(file.path(fig_dir, "Plot01_Drug_Network_Arc_medium.pdf"), 
+       p4, width = 16, height = 16)
+```
+
+
+```{r}
+library(openxlsx)
+library(igraph)
+library(dplyr)
+library(ggplot2)
+
+# --- Read data ---
+drug_pairs_all <- read.xlsx(file.path(input_dir, "01_final_unique_pairs_spearman.xlsx"))
+
+library(readxl)
+
+# Read data
+mat_df <- read_excel(file.path(input_dir, "12_Final_L2FC_Matrix_Drugs_Only_367_with_label.xlsx"),
+  sheet = 1,  # Specify worksheet
+  col_names = TRUE  # Use the first row as column names
+)
+
+# Use the first column as row names
+row_names <- mat_df[[1]]
+mat_df <- mat_df[, -1]
+
+# Convert to matrix
+mat <- as.matrix(mat_df)
+rownames(mat) <- row_names
+
+# ============================================================
+# Calculate key statistics
+# ============================================================
+
+# 1. Overall statistics
+n_proteins <- nrow(mat)
+n_compounds <- ncol(mat)
+n_total_possible_edges <- choose(n_compounds, 2)
+
+cat("=== Basic Statistics ===\n")
+cat("Total number of proteins:", n_proteins, "\n")
+cat("Total number of compounds:", n_compounds, "\n")
+cat("Total number of possible compound pairs:", n_total_possible_edges, "\n\n")
+
+# 2. Calculate the number of common proteins between each compound pair
+calculate_common_proteins <- function(drug1, drug2, mat) {
+  v1 <- mat[, drug1]
+  v2 <- mat[, drug2]
+  sum(!is.na(v1) & !is.na(v2))
+}
+
+# Add the number of common proteins for all drug pairs
+drug_pairs_all$n_common_proteins <- mapply(
+  calculate_common_proteins,
+  drug1 = drug_pairs_all$Drug1,
+  drug2 = drug_pairs_all$Drug2,
+  MoreArgs = list(mat = mat)
+)
+
+# 3. Calculate significance (using the p-value of Spearman correlation here)
+calculate_correlation_pvalue <- function(drug1, drug2, mat) {
+  v1 <- mat[, drug1]
+  v2 <- mat[, drug2]
+  ok <- !is.na(v1) & !is.na(v2)
+  
+  if (sum(ok) < 3) return(NA)
+  
+  test_result <- cor.test(v1[ok], v2[ok], method = "spearman")
+  return(test_result$p.value)
+}
+
+cat("Calculating correlation significance (p-values)...\n")
+drug_pairs_all$p_value <- mapply(
+  calculate_correlation_pvalue,
+  drug1 = drug_pairs_all$Drug1,
+  drug2 = drug_pairs_all$Drug2,
+  MoreArgs = list(mat = mat)
+)
+
+# 4. FDR correction
+drug_pairs_all$fdr <- p.adjust(drug_pairs_all$p_value, method = "fdr")
+
+# 5. Statistics based on different thresholds
+# Method 1: Based on FDR (similar to the literature)
+fdr_threshold <- 0.01  # 1% FDR
+drug_pairs_fdr <- drug_pairs_all %>%
+  filter(!is.na(fdr), fdr < fdr_threshold)
+
+# Method 2: Based on correlation threshold (currently used)
+cor_threshold <- 0.5
+drug_pairs_cor <- drug_pairs_all %>%
+  filter(Spearman_Correlation >= cor_threshold)
+
+cat("\n=== Filtering Results ===\n")
+cat("Using FDR < 1% threshold:\n")
+cat("  Number of significant edges:", nrow(drug_pairs_fdr), "/", n_total_possible_edges, "\n")
+cat("  Percentage:", round(nrow(drug_pairs_fdr)/n_total_possible_edges*100, 2), "%\n\n")
+
+cat("Using Spearman ≥ 0.5 threshold:\n")
+cat("  Number of significant edges:", nrow(drug_pairs_cor), "/", n_total_possible_edges, "\n")
+cat("  Percentage:", round(nrow(drug_pairs_cor)/n_total_possible_edges*100, 2), "%\n\n")
+
+# 6. Select an appropriate threshold for subsequent analysis
+# Recommended: combine FDR and correlation
+drug_pairs_filtered <- drug_pairs_all %>%
+  filter(!is.na(fdr), 
+         fdr < 0.01 & Spearman_Correlation >= 0.5)  # 1% FDR + moderate correlation
+
+cat("Using FDR < 1% and Spearman ≥ 0.5:\n")
+cat("  Number of edges:", nrow(drug_pairs_filtered), "/", n_total_possible_edges, "\n\n")
+
+# ============================================================
+# Network construction and community detection
+# ============================================================
+
+# Create network (using filtered data)
+g <- graph_from_data_frame(
+  d = drug_pairs_filtered[, c("Drug1", "Drug2", "Spearman_Correlation")],
+  directed = FALSE
+)
+
+E(g)$weight <- drug_pairs_filtered$Spearman_Correlation
+
+# Count the number of compounds with significant connections
+compounds_in_network <- unique(c(drug_pairs_filtered$Drug1, drug_pairs_filtered$Drug2))
+n_compounds_connected <- length(compounds_in_network)
+
+cat("=== Network Statistics ===\n")
+cat("Total number of compounds:", n_compounds, "\n")
+cat("Number of compounds with at least one significant connection:", n_compounds_connected, "\n")
+cat("Percentage:", round(n_compounds_connected/n_compounds*100, 1), "%\n\n")
+
+# Calculate statistics for the number of common proteins
+common_proteins_stats <- summary(drug_pairs_filtered$n_common_proteins)
+cat("Statistics of common protein counts between compound pairs:\n")
+print(common_proteins_stats)
+cat("\nMedian:", median(drug_pairs_filtered$n_common_proteins, na.rm = TRUE), "\n\n")
+
+# Community detection
+set.seed(123)
+communities <- cluster_louvain(g, weights = E(g)$weight)
+
+cat("=== Community Detection ===\n")
+cat("Number of detected communities:", length(communities), "\n")
+cat("Sizes of each community:\n")
+print(sizes(communities))
+
+# Identify large communities (≥3 compounds)
+large_communities <- which(sizes(communities) >= 3)
+cat("\nLarge communities (≥3 compounds):", length(large_communities), "\n\n")
+
+# Detailed community information
+community_info <- data.frame(
+  Compound = V(g)$name,
+  Community = membership(communities),
+  Degree = degree(g),
+  Betweenness = betweenness(g),
+  stringsAsFactors = FALSE
+)
+
+# Add DRP information for each community (if available)
+# Here it is assumed that DRP classification information for compounds is available
+if (exists("drug_info")) {
+  community_info <- community_info %>%
+    left_join(drug_info %>% select(Drug, DRP), 
+              by = c("Compound" = "Drug"))
+}
+
+# ============================================================
+# Generate result tables
+# ============================================================
+
+# Table 1: Network statistics summary
+network_summary <- data.frame(
+  Metric = c(
+    "Total proteins",
+    "Total compounds",
+    "Possible compound pairs",
+    "Significant edges (FDR < 1%, r ≥ 0.5)",
+    "Percentage of edges",
+    "Compounds with ≥1 connection",
+    "Percentage of compounds",
+    "Median common proteins per pair",
+    "Communities detected",
+    "Large communities (≥3 compounds)"
+  ),
+  Value = c(
+    n_proteins,
+    n_compounds,
+    n_total_possible_edges,
+    nrow(drug_pairs_filtered),
+    paste0(round(nrow(drug_pairs_filtered)/n_total_possible_edges*100, 2), "%"),
+    n_compounds_connected,
+    paste0(round(n_compounds_connected/n_compounds*100, 1), "%"),
+    median(drug_pairs_filtered$n_common_proteins, na.rm = TRUE),
+    length(communities),
+    length(large_communities)
+  )
+)
+
+print(network_summary)
+
+# Table 2: Top community details
+community_summary <- community_info %>%
+  group_by(Community) %>%
+  summarise(
+    Size = n(),
+    Compounds = paste(head(Compound, 5), collapse = "; "),
+    Avg_Degree = round(mean(Degree), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Size)) %>%
+  head(10)
+
+cat("\n=== Top 10 Communities ===\n")
+print(community_summary)
+
+# Export
+write.xlsx(
+  list(
+    "Network_Summary" = network_summary,
+    "Community_Summary" = community_summary,
+    "Community_Details" = community_info,
+    "Filtered_Pairs" = drug_pairs_filtered
+  ),
+  file = file.path(data_dir, "05_Network_Analysis_Summary.xlsx")
+)
+
+cat("\n✓ Statistical summary exported\n")
+```
+

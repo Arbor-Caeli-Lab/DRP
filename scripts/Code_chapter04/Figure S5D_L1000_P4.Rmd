@@ -1,0 +1,489 @@
+---
+title: "Figure S5D_L1000"
+output: html_document
+date: "2026-06-09"
+---
+
+```{r}
+source(file.path(knitr::current_input(dir = TRUE), "..", "_common", "repro_paths.R"))
+paths <- repro_paths("Code_chapter04")
+repo_root <- paths$repo_root
+input_dir <- paths$input_dir
+data_dir <- paths$results_dir
+fig_dir <- paths$results_dir
+folder_path <- input_dir
+
+library(cmapR)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(pheatmap)
+library(patchwork)
+
+# ══════════════════════════════════════════════════════════════════
+# PHASE 1: Prepare the Drug-Toxicity Reference Table
+# ══════════════════════════════════════════════════════════════════
+
+compound_metrics<-read.csv(file.path(input_dir, "Table S3-DRP_inhibition-L1000.csv"),check.names = FALSE,na.strings = c("NA", "not available"))
+
+
+my_drugs <- compound_metrics %>%
+  filter(!is.na(Inhibition)) %>%
+  group_by(Compound_Name) %>%
+  summarise(
+    mean_inhib = mean(Inhibition, na.rm = TRUE),
+    max_inhib  = max(Inhibition, na.rm = TRUE),
+    n_conc     = n(),
+    conc_list  = paste(Concentration, collapse = "/"),
+    .groups    = "drop"
+  ) %>%
+  mutate(
+    drug_lower = tolower(Compound_Name),   # Used for matching against L1000
+    is_toxic   = max_inhib > 30            # Simple binary classification threshold; adjustable
+  )
+
+unique_drugs <- unique(my_drugs$Compound_Name)
+unique_drugs <- unique_drugs[!is.na(unique_drugs)]
+
+```
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# PHASE 2: L1000 Data Loading & CPS-6 Gene Mapping
+# ══════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  PHASE 2: L1000 DATA PREPARATION\n")
+cat("════════════════════════════════════════════════════\n")
+
+gctx_file <- file.path(input_dir,
+  "GSE92742_Broad_LINCS_Level5_COMPZ.MODZ_n473647x12328.gctx")
+
+sig_info  <- fread(file.path(input_dir, "GSE92742_Broad_LINCS_sig_info.txt.gz"))
+gene_info <- fread(file.path(input_dir, "GSE92742_Broad_LINCS_gene_info.txt.gz"))
+
+# ── CPS-6 ──
+cps8_weights <- c(
+  TBL1X   = -20.98158776,
+  NAPA    = 20.57534422,
+  PLEKHA7 = -11.15330576,
+  ACSL1  = 20.77593761,
+  ARL8B    = 19.05640755,
+  CCDC90B    = 13.69596005
+)
+
+
+cps8_direction <- ifelse(cps8_weights > 0, "up", "down")
+
+# ── Map to L1000 gene IDs ──
+gene_map <- gene_info[pr_gene_symbol %in% names(cps8_weights)]
+gene_map <- gene_map[, .(pr_gene_id = as.character(pr_gene_id),
+                          pr_gene_symbol, pr_is_lm)]
+
+# Verify presence in the GCTX file
+all_rids <- read_gctx_ids(gctx_file, dim = "row")
+gene_map <- gene_map[pr_gene_id %in% all_rids]
+
+# Add weights and directions
+gene_map[, weight    := cps8_weights[pr_gene_symbol]]
+gene_map[, direction := cps8_direction[pr_gene_symbol]]
+
+cat("\n═══ CPS-6 Gene Coverage in L1000 ═══\n")
+print(gene_map)
+
+found   <- gene_map$pr_gene_symbol
+missing <- setdiff(names(cps8_weights), found)
+cat(sprintf("\nCoverage: %d / 6 genes\n", length(found)))
+if (length(missing) > 0) {
+  cat("Missing genes:", paste(missing, collapse = ", "), "\n")
+  cat("(These genes may not be among the 12,328 genes represented in L1000)\n")
+}
+```
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# PHASE 3: Extract L1000 Data and Calculate CPS-6 Transcriptional Scores
+# ══════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  PHASE 3: DATA EXTRACTION & SCORE CALCULATION\n")
+cat("════════════════════════════════════════════════════\n")
+
+# Select compound-treatment signatures
+sig_cp <- sig_info[pert_type == "trt_cp"]
+all_cids   <- read_gctx_ids(gctx_file, dim = "col")
+valid_sigs <- intersect(sig_cp$sig_id, all_cids)
+
+cat(sprintf("Compound-treatment signatures: %d\n", length(valid_sigs)))
+
+# Extract the CPS-6 submatrix
+cat("Extracting data from GCTX (approximately 5-15 minutes)...\n")
+t0 <- Sys.time()
+ds <- parse_gctx(gctx_file,
+                 rid = gene_map$pr_gene_id,
+                 cid = valid_sigs)
+cat(sprintf("Elapsed time: %.1f minutes\n",
+            difftime(Sys.time(), t0, units = "mins")))
+
+mat <- ds@mat  # Rows = gene_id, columns = sig_id, values = z-scores
+
+cat(sprintf("Extracted matrix: %d genes × %d signatures\n",
+            nrow(mat), ncol(mat)))
+
+# ── Calculate two types of CPS-6 scores ──
+
+# Method 1: Weighted score using proteomic weights
+# CPS8_weighted = Σ(w_i × z_i) / Σ|w_i|, normalized
+gene_ids_ordered <- gene_map$pr_gene_id
+weights_ordered  <- gene_map$weight
+names(weights_ordered) <- gene_ids_ordered
+
+w_mat <- matrix(weights_ordered, nrow = length(gene_ids_ordered),
+                ncol = ncol(mat))
+cps8_weighted <- colSums(mat[gene_ids_ordered, ] * w_mat, na.rm = TRUE) /
+                 sum(abs(weights_ordered))
+
+# Method 2: Simple directional score
+# CPS8_simple = mean_z(up genes) − mean_z(down genes)
+up_ids   <- gene_map[direction == "up"]$pr_gene_id
+down_ids <- gene_map[direction == "down"]$pr_gene_id
+
+up_z <- if (length(up_ids) == 1) {
+  mat[up_ids, ]
+} else {
+  colMeans(mat[up_ids, , drop = FALSE], na.rm = TRUE)
+}
+
+down_z <- if (length(down_ids) == 1) {
+  mat[down_ids, ]
+} else {
+  colMeans(mat[down_ids, , drop = FALSE], na.rm = TRUE)
+}
+
+cps8_simple <- up_z - down_z
+
+# Assemble results
+res <- data.table(
+  sig_id        = colnames(mat),
+  cps8_weighted = as.numeric(cps8_weighted),
+  cps8_simple   = as.numeric(cps8_simple)
+)
+
+# Merge signature metadata
+res <- merge(res,
+             sig_cp[, .(sig_id, pert_id, pert_iname, cell_id,
+                        pert_idose, pert_itime)],
+             by = "sig_id", all.x = TRUE)
+
+# Aggregate to the compound level
+compound_l1000 <- res[, .(
+  median_weighted = median(cps8_weighted, na.rm = TRUE),
+  mean_weighted   = mean(cps8_weighted, na.rm = TRUE),
+  median_simple   = median(cps8_simple, na.rm = TRUE),
+  mean_simple     = mean(cps8_simple, na.rm = TRUE),
+  sd_weighted     = sd(cps8_weighted, na.rm = TRUE),
+  n_sigs          = .N,
+  cells_tested    = paste(unique(cell_id), collapse = ";")
+), by = pert_iname]
+
+compound_l1000[, drug_lower := tolower(pert_iname)]
+
+cat(sprintf("\nTotal L1000 compounds: %d\n", nrow(compound_l1000)))
+```
+
+
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# PHASE 4: Match Study Compounds to L1000
+# ══════════════════════════════════════════════════════════════════
+
+cat("\n════════════════════════════════════════════════════\n")
+cat("  PHASE 4: COMPOUND MATCHING\n")
+cat("════════════════════════════════════════════════════\n")
+
+# ── 4a. Exact matching ──
+matched <- merge(my_drugs, compound_l1000,
+                 by = "drug_lower", all = FALSE)
+
+cat(sprintf("Exact matches: %d / %d drugs\n", nrow(matched), nrow(my_drugs)))
+
+# ── 4b. Fuzzy matching to identify naming differences ──
+unmatched <- my_drugs %>%
+  filter(!drug_lower %in% compound_l1000$drug_lower)
+
+if (nrow(unmatched) > 0) {
+  cat("\nUnmatched drugs (attempting fuzzy matching):\n")
+  l1000_names <- compound_l1000$drug_lower
+
+  for (i in seq_len(nrow(unmatched))) {
+    drug <- unmatched$drug_lower[i]
+    # Check for substring matches
+    partial <- l1000_names[grepl(drug, l1000_names, fixed = TRUE) |
+                           grepl(gsub("-", "", drug),
+                                 gsub("-", "", l1000_names), fixed = TRUE)]
+    if (length(partial) > 0) {
+      cat(sprintf("  '%s' → Possible matches: %s\n",
+                  drug, paste(head(partial, 5), collapse = ", ")))
+    } else {
+      cat(sprintf("  '%s' → No match\n", drug))
+    }
+  }
+
+  cat("\n★ To manually correct compound matches, edit the following code ★\n")
+  cat("# manual_fix <- data.frame(\n")
+  cat("#   drug_lower_old = c('your_name', ...),\n")
+  cat("#   drug_lower_new = c('L1000_name', ...)\n")
+  cat("# )\n")
+}
+
+cat(sprintf("\nFinal matched compounds: %d drugs\n", nrow(matched)))
+cat("Matched drugs:\n")
+print(matched %>%
+        dplyr::select(drug_lower, mean_inhib, max_inhib, is_toxic,
+               median_weighted, n_sigs) %>%
+        arrange(desc(max_inhib)))
+```
+
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# PHASE 5: Multi-Level Statistical Validation
+# ══════════════════════════════════════════════════════════════════
+
+cat("\n╔═══════════════════════════════════════════════════╗\n")
+cat("║      PHASE 5: STATISTICAL VALIDATION             ║\n")
+cat("╚═══════════════════════════════════════════════════╝\n")
+
+# ─────────────────────────────────────────
+# Validation 1: Continuous-variable correlation
+# L1000 CPS-6 score vs measured inhibition
+# ─────────────────────────────────────────
+cat("\n── Validation 1: CPS-6 Transcriptional Score vs Proteomic Inhibition Rate (Spearman) ──\n")
+
+if (nrow(matched) >= 8) {
+  cor_w <- cor.test(matched$median_weighted, matched$max_inhib,
+                    method = "spearman", exact = FALSE)
+  cor_s <- cor.test(matched$median_simple,   matched$max_inhib,
+                    method = "spearman", exact = FALSE)
+
+  cat(sprintf("  Weighted score: ρ = %+.3f, p = %.3e (n=%d)\n",
+              cor_w$estimate, cor_w$p.value, nrow(matched)))
+  cat(sprintf("  Simple score:   ρ = %+.3f, p = %.3e (n=%d)\n",
+              cor_s$estimate, cor_s$p.value, nrow(matched)))
+
+  # A positive correlation indicates that the proteomics-derived toxicity direction
+  # is also associated with toxicity in the transcriptomic data
+  if (cor_w$estimate > 0 & cor_w$p.value < 0.05) {
+    cat("  ✓ Cross-omics validation successful: proteomics-derived CPS-6 weights are reproduced in transcriptomic data\n")
+  }
+} else {
+  cat("  Fewer than 8 drugs were matched; correlation analysis was skipped\n")
+}
+
+# ─────────────────────────────────────────
+# Validation 2: Binary comparison — Toxic vs Non-toxic
+# ─────────────────────────────────────────
+cat("\n── Validation 2: L1000 CPS-6 Scores in Toxic vs Non-toxic Drugs ──\n")
+
+n_toxic    <- sum(matched$is_toxic)
+n_nontoxic <- sum(!matched$is_toxic)
+
+if (n_toxic >= 3 & n_nontoxic >= 3) {
+  wt <- wilcox.test(median_weighted ~ is_toxic, data = matched)
+  cat(sprintf("  Toxic drugs    (n=%d): median CPS-6 = %.3f\n",
+              n_toxic, median(matched$median_weighted[matched$is_toxic])))
+  cat(sprintf("  Non-toxic drugs(n=%d): median CPS-6 = %.3f\n",
+              n_nontoxic, median(matched$median_weighted[!matched$is_toxic])))
+  cat(sprintf("  Wilcoxon p = %.4f\n", wt$p.value))
+
+  # Effect size
+  r_eff <- abs(qnorm(wt$p.value / 2)) / sqrt(nrow(matched))
+  cat(sprintf("  Effect size r = %.3f\n", r_eff))
+}
+
+# ─────────────────────────────────────────
+# Validation 3: Single-Gene Directional Concordance
+# ─────────────────────────────────────────
+cat("\n── Validation 3: Single-Gene Directional Concordance ──\n")
+
+gene_validation <- data.frame()
+
+for (i in seq_len(nrow(gene_map))) {
+  gid  <- gene_map$pr_gene_id[i]
+  gsym <- gene_map$pr_gene_symbol[i]
+  gdir <- gene_map$direction[i]
+  gw   <- gene_map$weight[i]
+
+  # Extract the z-score of this gene across all signatures
+  z_all <- mat[gid, ]
+
+  # Construct a temporary table and link it to the study compounds
+  temp <- data.table(sig_id = names(z_all), z = as.numeric(z_all))
+  temp <- merge(temp, res[, .(sig_id, pert_iname)], by = "sig_id")
+  temp[, drug_lower := tolower(pert_iname)]
+  temp <- merge(temp, my_drugs[, c("drug_lower", "max_inhib", "is_toxic")],
+                by = "drug_lower")
+
+  if (nrow(temp) < 10) next
+
+  # Spearman correlation with inhibition rate
+  ct <- cor.test(temp$z, temp$max_inhib,
+                 method = "spearman", exact = FALSE)
+
+  # Assess directional concordance
+  # If the proteomic weight > 0 (up → toxicity),
+  # the transcriptomic z-score should also correlate positively with inhibition (ρ > 0)
+  # If the weight < 0 (down → toxicity), ρ should be negative
+  expected_sign <- sign(gw)
+  observed_sign <- sign(ct$estimate)
+  consistent    <- expected_sign == observed_sign
+
+  # Mean z-score difference between Toxic and Non-toxic groups
+  mean_z_toxic    <- mean(temp$z[temp$is_toxic], na.rm = TRUE)
+  mean_z_nontoxic <- mean(temp$z[!temp$is_toxic], na.rm = TRUE)
+
+  gene_validation <- rbind(gene_validation, data.frame(
+    Gene              = gsym,
+    Weight            = gw,
+    Expected_Dir      = gdir,
+    L1000_rho         = round(ct$estimate, 4),
+    L1000_p           = ct$p.value,
+    Mean_z_Toxic      = round(mean_z_toxic, 4),
+    Mean_z_NonToxic   = round(mean_z_nontoxic, 4),
+    Direction_Match   = consistent,
+    Is_Landmark       = gene_map$pr_is_lm[i],
+    N_datapoints      = nrow(temp)
+  ))
+}
+
+gene_validation$L1000_FDR <- p.adjust(gene_validation$L1000_p, method = "BH")
+gene_validation <- gene_validation %>% arrange(L1000_p)
+
+cat("\n")
+print(gene_validation %>%
+        dplyr::select(Gene, Weight, Expected_Dir, L1000_rho,
+               L1000_p, Direction_Match, Is_Landmark))
+
+n_consistent <- sum(gene_validation$Direction_Match)
+cat(sprintf("\nDirectionally concordant genes: %d / %d (%.0f%%)\n",
+            n_consistent, nrow(gene_validation),
+            n_consistent / nrow(gene_validation) * 100))
+
+# Binomial test: determine whether directional concordance exceeds 50%
+binom_p <- binom.test(n_consistent, nrow(gene_validation),
+                       p = 0.5, alternative = "greater")$p.value
+cat(sprintf("Binomial test p = %.4f (H0: directional concordance = 50%%)\n", binom_p))
+
+# ─────────────────────────────────────────
+# Validation 4: Permutation Test
+# ─────────────────────────────────────────
+cat("\n── Validation 4: Permutation Test ──\n")
+
+if (nrow(matched) >= 8) {
+  set.seed(42)
+  obs_rho <- cor(matched$median_weighted, matched$max_inhib,
+                 method = "spearman")
+
+  n_perm <- 10000
+  perm_rhos <- replicate(n_perm, {
+    perm_inhib <- sample(matched$max_inhib)
+    cor(matched$median_weighted, perm_inhib, method = "spearman")
+  })
+
+  perm_p <- mean(abs(perm_rhos) >= abs(obs_rho))
+  cat(sprintf("  Observed Spearman ρ: %.3f\n", obs_rho))
+  cat(sprintf("  Permutation p (10,000 permutations): %.4f\n", perm_p))
+  cat(sprintf("  Exceeds %.1f%% of random permutations\n", (1 - perm_p) * 100))
+}
+
+# ─────────────────────────────────────────
+# Validation 5: Ranking of Toxic Study Drugs Across the L1000 Landscape
+# ─────────────────────────────────────────
+cat("\n── Validation 5: Percentile Ranking of Toxic Study Drugs Among All L1000 Compounds ──\n")
+
+total_compounds <- nrow(compound_l1000)
+matched_toxic <- matched %>% dplyr::filter(is_toxic) %>% arrange(desc(median_weighted))
+
+percentile_results <- data.frame()
+for (i in seq_len(nrow(matched_toxic))) {
+  d   <- matched_toxic[i, ]
+  rk  <- sum(compound_l1000$median_weighted <= d$median_weighted)
+  pct <- rk / total_compounds * 100
+  percentile_results <- rbind(percentile_results, data.frame(
+    Drug       = d$drug_lower,
+    Inhib_Rate = d$max_inhib,
+    CPS8_L1000 = round(d$median_weighted, 3),
+    Percentile = round(pct, 1)
+  ))
+  cat(sprintf("  %-25s inhib=%5.1f%% | CPS-6=%.3f | %.1fth percentile\n",
+              d$drug_lower, d$max_inhib, d$median_weighted, pct))
+}
+
+# Mean percentile of toxic drugs vs random expectation (50%)
+mean_pct <- mean(percentile_results$Percentile)
+cat(sprintf("\n  Mean percentile of toxic drugs: %.1f%% (random expectation = 50%%)\n", mean_pct))
+wt_pct <- wilcox.test(percentile_results$Percentile, mu = 50)
+cat(sprintf("  One-sample Wilcoxon p = %.4f\n", wt_pct$p.value))
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# PHASE 6: Visualization
+# ══════════════════════════════════════════════════════════════════
+data_dir <- paths$results_dir
+fig_dir <- paths$results_dir
+folder_path <- input_dir
+
+
+# ── Figure 1: Primary validation plot — L1000 CPS-6 score vs measured inhibition ──
+if (nrow(matched) >= 8) {
+  
+  r_label <- sprintf("ρ = %.3f\np = %.4f\nn = %d",
+                     cor_w$estimate, cor_w$p.value, nrow(matched))
+
+  p1 <- ggplot(matched, aes(x = median_weighted, y = max_inhib)) +
+    geom_point(aes(color = max_inhib), size = 2.5, alpha = 0.7) +
+    scale_color_gradient(
+      low = "#deebf7",
+      high = "#5F6A8F", 
+      name = "Inhibition\nRate (%)"
+    ) +
+    geom_smooth(method = "lm", se = TRUE, 
+                color = "#5F6A8F", linetype = "dashed",
+                linewidth = 1, alpha = 0.2) +
+    annotate("text", 
+             x = min(matched$median_weighted) + 0.05 * diff(range(matched$median_weighted)),
+             y = max(matched$max_inhib) - 0.05 * diff(range(matched$max_inhib)),
+             label = r_label,
+             hjust = 0, vjust = 1, size = 4,
+             color = "black", fontface = "bold",
+             lineheight = 0.9) +
+    labs(
+      title = "Cross-Omics Validation: Proteomics vs L1000 CPS-6 Score",
+      subtitle = sprintf("Measured toxicity vs weighted CPS-6 transcriptional score | n = %d drugs",
+                         nrow(matched)),
+      x = "CPS-6 Score (L1000 Transcriptional)",
+      y = "Inhibition (%)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 9, color = "gray30"),
+      legend.position = "right",
+      legend.key.height = unit(1, "cm"),
+      aspect.ratio = 1,
+      panel.grid.minor = element_blank()
+    )
+
+  ggsave(file.path(fig_dir,"Fig_L1000_validation_scatter.pdf"), p1, width = 7, height = 7)
+  print(p1)
+}
+
+```
