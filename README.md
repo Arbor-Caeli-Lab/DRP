@@ -11,7 +11,7 @@ The project is distributed in two parts:
 - The input data and supplied analysis results are distributed as a separate
   Zenodo package because they are too large for a code-only Git repository.
 
-> Zenodo data and results record: **[add the final Zenodo DOI here](10.5281/zenodo.22245931)**
+> Zenodo data and results record: **[10.5281/zenodo.22245931](https://doi.org/10.5281/zenodo.22245931)**
 
 ## What the project contains
 
